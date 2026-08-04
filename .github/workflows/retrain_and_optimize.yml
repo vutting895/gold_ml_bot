@@ -52,4 +52,114 @@ jobs:
             git commit -m "🤖 Auto-retrained ML model & updated best_config.json [skip ci]" || echo "ไม่มีการเปลี่ยนแปลงไฟล์"
             git push origin main || echo "ไม่มีไฟล์ใหม่ให้ Push"
           fi
-          
+
+    model = joblib.load(MODEL_FILE_PATH)
+    df = prepare_backtest_data()
+
+    param_grid = {
+        'PROBA_THRESHOLD': [0.55, 0.60, 0.65, 0.70],
+        'RR_RATIO': [2.0, 2.5, 3.0],
+        'GOLD_SL_BUFFER': [0.50, 0.80, 1.00]
+    }
+
+    grid = list(itertools.product(
+        param_grid['PROBA_THRESHOLD'],
+        param_grid['RR_RATIO'],
+        param_grid['GOLD_SL_BUFFER']
+    ))
+
+    print("⚙️ กำลังประมวลผล Grid Search Optimization...")
+    best_score = -float('inf')
+    best_config = {}
+
+    for threshold, rr, sl_buf in grid:
+        total_pnl = 0.0
+        win_count = 0
+        loss_count = 0
+
+        for i in range(4, len(df) - 50):
+            row = df.iloc[i]
+            prev_row = df.iloc[i-1]
+            time_idx = df.index[i]
+
+            is_long  = (row['H1_Trend'] == 1) and (row['M15_Trend'] == 1) and row['Bullish_FVG']
+            is_short = (row['H1_Trend'] == -1) and (row['M15_Trend'] == -1) and row['Bearish_FVG']
+
+            if not (is_long or is_short):
+                continue
+
+            entry_price = float(row['Close'])
+            
+            if is_long:
+                sl_price  = float(min(row['Low'], prev_row['Low'])) - sl_buf
+                risk_dist = entry_price - sl_price
+                fvg_size  = float(row['Low'] - df.iloc[i-3]['High'])
+            else:
+                sl_price  = float(max(row['High'], prev_row['High'])) + sl_buf
+                risk_dist = sl_price - entry_price
+                fvg_size  = float(df.iloc[i-3]['Low'] - row['High'])
+
+            if risk_dist <= 0:
+                continue
+
+            # จัดเรียงคอลัมน์ Features ให้ตรงกับตอน Train โมเดลเป๊ะๆ
+            features = pd.DataFrame([{
+                'FVG_Size': fvg_size,
+                'ATR': float(row['ATR']),
+                'RSI': float(row['RSI']),
+                'Hour': int(time_idx.hour),
+                'DayOfWeek': int(time_idx.dayofweek),
+                'Risk_Distance': risk_dist
+            }])
+
+            win_prob = float(model.predict_proba(features)[0][1])
+
+            if win_prob >= threshold:
+                tp_price = entry_price + (risk_dist * rr) if is_long else entry_price - (risk_dist * rr)
+                future_prices = df.iloc[i+1:i+50]
+
+                trade_won = False
+                for _, f_row in future_prices.iterrows():
+                    if is_long:
+                        if f_row['High'] >= tp_price:
+                            trade_won = True
+                            break
+                        elif f_row['Low'] <= sl_price:
+                            break
+                    else:
+                        if f_row['Low'] <= tp_price:
+                            trade_won = True
+                            break
+                        elif f_row['High'] >= sl_price:
+                            break
+
+                if trade_won:
+                    total_pnl += (risk_dist * rr)
+                    win_count += 1
+                else:
+                    total_pnl -= risk_dist
+                    loss_count += 1
+
+        total_trades = win_count + loss_count
+        if total_trades > 0 and total_pnl > best_score:
+            best_score = total_pnl
+            best_config = {
+                "PROBA_THRESHOLD": threshold,
+                "RR_RATIO": rr,
+                "GOLD_SL_BUFFER": sl_buf,
+                "BACKTEST_WIN_RATE": round((win_count / total_trades) * 100, 2),
+                "TOTAL_TRADES": total_trades,
+                "ESTIMATED_NET_PNL": round(total_pnl, 2)
+            }
+
+    if best_config:
+        print(f"🎯 ค้นพบ Config ที่ดีที่สุด: {best_config}")
+        with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(best_config, f, indent=2, ensure_ascii=False)
+        print(f"💾 บันทึกค่าลงใน {CONFIG_FILE_PATH} เรียบร้อยแล้ว")
+    else:
+        print("⚠️ ไม่พบ Config ที่ทำกำไรได้ในรอบ Backtest นี้")
+
+if __name__ == "__main__":
+    run_grid_search()
+    
