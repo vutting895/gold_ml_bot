@@ -1,6 +1,5 @@
 import json
 import os
-from datetime import datetime
 import joblib
 import gspread
 from google.oauth2.service_account import Credentials
@@ -15,7 +14,6 @@ TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Gold_Trading_Logs")
 
-STATE_FILE = "last_signal.json"
 MODEL_FILE = "gold_ml_filter.pkl"
 
 
@@ -42,7 +40,6 @@ def fetch_twelvedata_m5_data(count=100):
 
     values = data["values"]
     parsed_data = []
-    # เรียงลำดับข้อมูลจากอดีตมาปัจจุบันเพื่อให้ Indicator คำนวณถูกต้อง
     for c in reversed(values):
       parsed_data.append({
           "time": pd.to_datetime(c["datetime"]),
@@ -76,14 +73,11 @@ def send_telegram_alert(message):
     print(f"เกิดข้อผิดพลาดในการส่ง Telegram: {e}")
 
 
-def log_to_google_sheet(row_data):
-  """บันทึกข้อมูลสัญญาณลง Google Sheets
-
-  พร้อมตรวจสอบและสร้าง Worksheet และ Header อัตโนมัติ
-  """
+def get_google_sheet_handle():
+  """จัดการเชื่อมต่อและดึง Object ของ Worksheet 'Signals'"""
   if not GOOGLE_CREDENTIALS_JSON:
     print("ไม่พบข้อมูล Google Credentials JSON")
-    return
+    return None
 
   try:
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -94,52 +88,37 @@ def log_to_google_sheet(row_data):
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     client = gspread.authorize(creds)
 
-    # 1. เปิด Google Spreadsheet ตามชื่อที่กำหนด
-    try:
-      spreadsheet = client.open(GOOGLE_SHEET_NAME)
-    except gspread.exceptions.SpreadsheetNotFound:
-      print(
-          f"❌ ไม่พบ Spreadsheet ชื่อ '{GOOGLE_SHEET_NAME}'"
-          " กรุณาสร้างไฟล์ Google Sheets และแชร์สิทธิ์ให้ Service Account"
-          " เรียบร้อยแล้ว"
-      )
-      return
+    spreadsheet = client.open(GOOGLE_SHEET_NAME)
 
-    # 2. ตรวจสอบว่ามี Worksheet ชื่อ "Signals" หรือยัง ถ้ายังให้สร้างอัตโนมัติ
+    # ดึงหรือสร้าง Worksheet "Signals"
     try:
       sheet = spreadsheet.worksheet("Signals")
     except gspread.exceptions.WorksheetNotFound:
       sheet = spreadsheet.add_worksheet(title="Signals", rows="1000", cols="10")
-      print('✨ สร้าง Worksheet "Signals" ให้อัตโนมัติสำเร็จ')
 
-    # 3. ตรวจสอบว่ามี Header หรือยัง ถ้าตารางว่าง ให้เพิ่ม Header อัตโนมัติทันที
+    # ตรวจสอบว่ามี Header หรือยัง
     existing_data = sheet.get_all_values()
     if not existing_data:
       headers = ["Time", "Type", "Entry", "SL", "TP", "Status", "PnL"]
       sheet.append_row(headers)
-      print("✨ เพิ่มตาราง Header อัตโนมัติสำเร็จ (Time, Type, Entry, SL, TP, Status, PnL)")
 
-    # 4. บันทึกข้อมูลแถวใหม่ (Row Data) ลงในตาราง
-    sheet.append_row(row_data)
-    print("📥 บันทึกข้อมูลสัญญาณลง Google Sheets สำเร็จ")
-
+    return sheet
   except Exception as e:
-    print(f"⚠️ เกิดข้อผิดพลาดในการจัดการ Google Sheets: {e}")
+    print(f"⚠️ เกิดข้อผิดพลาดในการเชื่อมต่อ Google Sheets: {e}")
+    return None
 
 
-
-def load_state():
-  """โหลดสถานะเวลาของสัญญาณล่าสุดเพื่อป้องกันการแจ้งเตือนซ้ำ"""
-  if os.path.exists(STATE_FILE):
-    with open(STATE_FILE, "r") as f:
-      return json.load(f)
-  return {"last_time": ""}
-
-
-def save_state(last_time):
-  """บันทึกสถานะเวลาของสัญญาณล่าสุด"""
-  with open(STATE_FILE, "w") as f:
-    json.dump({"last_time": str(last_time)}, f)
+def get_last_signal_time(sheet):
+  """ดึงเวลาของสัญญาณล่าสุดจาก Google Sheets เพื่อเช็คการส่งซ้ำ"""
+  if not sheet:
+    return ""
+  try:
+    records = sheet.get_all_values()
+    if len(records) > 1:  # มีข้อมูลมากกว่าแค่ Header
+      return records[-1][0]  # คอลัมน์แรก (Time)
+  except Exception as e:
+    print(f"เกิดข้อผิดพลาดในการเช็คเวลาสัญญาณล่าสุด: {e}")
+  return ""
 
 
 def detect_smc_fvg(df):
@@ -147,7 +126,7 @@ def detect_smc_fvg(df):
   if len(df) < 3:
     return None
 
-  i = len(df) - 2  # แท่งเทียนที่ปิดสมบูรณ์แล้วแท่งล่าสุด
+  i = len(df) - 2  # แท่งเทียนที่ปิดสมบูรณ์แล้ว
   if i < 2:
     return None
 
@@ -181,23 +160,30 @@ def detect_smc_fvg(df):
 
 
 def main():
-  print("กำลังรันระบบ Gold SMC Scanner...")
+  print("กำลังรันระบบ Gold SMC Scanner บน GitHub Actions...")
+
+  # 1. เชื่อมต่อ Google Sheets
+  sheet = get_google_sheet_handle()
+
+  # 2. ดึงข้อมูลราคา
   df = fetch_twelvedata_m5_data(100)
   if df.empty:
     print("ไม่สามารถดึงข้อมูลราคาได้")
     return
 
+  # 3. ตรวจจับสัญญาณ SMC
   signal = detect_smc_fvg(df)
   if not signal:
     print("ไม่พบสัญญาณ FVG ในรอบนี้")
     return
 
-  state = load_state()
-  if state.get("last_time") == signal["time"]:
-    print("สัญญาณนี้ถูกส่งแจ้งเตือนไปแล้ว ข้ามการทำงาน")
+  # 4. ตรวจสอบสัญญาณซ้ำจาก Google Sheets
+  last_time_in_sheet = get_last_signal_time(sheet)
+  if last_time_in_sheet == signal["time"]:
+    print(f"สัญญาณเวลา {signal['time']} ถูกแจ้งเตือนไปแล้ว ข้ามการทำงาน")
     return
 
-  # ตรวจสอบตัวกรอง Machine Learning (ถ้ามีไฟล์โมเดล)
+  # 5. กรองด้วย Machine Learning (ถ้ามีไฟล์โมเดล)
   ml_passed = True
   if os.path.exists(MODEL_FILE):
     try:
@@ -225,6 +211,7 @@ def main():
     except Exception as e:
       print(f"เกิดข้อผิดพลาดในระบบ ML Filter: {e}")
 
+  # 6. ส่งแจ้งเตือนและบันทึกข้อมูล
   if ml_passed:
     msg = (
         f"🚨 *Gold SMC Signal Detected!*\n"
@@ -250,11 +237,14 @@ def main():
         "OPEN",
         0.0,
     ]
-    log_to_google_sheet(row_data)
-    save_state(signal["time"])
-    print("ส่งสัญญาณและบันทึกข้อมูลเรียบร้อยแล้ว")
+
+    if sheet:
+      sheet.append_row(row_data)
+      print("บันทึกข้อมูลลง Google Sheets เรียบร้อยแล้ว")
+
+    print("ส่งสัญญาณเรียบร้อยแล้ว")
 
 
 if __name__ == "__main__":
   main()
- 
+  
