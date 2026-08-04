@@ -2,8 +2,8 @@ name: Auto Retrain Gold ML Model
 
 on:
   schedule:
-    # ตั้งเวลารันทุก เวลา 08.00 UTC (01:00 น. เช้าวันจันทร์ไทย ก่อนตลาดเปิด)
-    - cron: '0 18 * * 0'
+    # รันทุกวันจันทร์ - ศุกร์ เวลา 04:00 น. (เวลาไทย) / 21:00 UTC (วันอาทิตย์ - พฤหัสบดี)
+    - cron: '0 21 * * 0-4'
   workflow_dispatch: # ปุ่มกดสั่งเทรนด้วยตัวเอง
 
 jobs:
@@ -35,4 +35,3 @@ jobs:
           git add gold_ml_filter.pkl
           git commit -m "🤖 Auto-retrained ML model with latest market data [skip ci]" || exit 0
           git push
-          
