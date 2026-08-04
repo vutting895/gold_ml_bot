@@ -3,7 +3,10 @@ name: Retrain Model & Auto-Optimize Config
 on:
   schedule:
     - cron: '0 0 * * 0'   # ⏰ รันทุกวันอาทิตย์ เวลา 00:00 UTC (ช่วงตลาดปิด)
-  workflow_dispatch:      # 🔘 ปุ่มกดรันมือบน GitHub
+  workflow_dispatch:      # 🔘 ปุ่มกดสั่งรันด้วยมือบนหน้าเว็บ GitHub
+
+permissions:
+  contents: write         # สิทธิ์ในการ Push ไฟล์ gold_ml_filter.pkl และ best_config.json กลับเข้า Repository
 
 jobs:
   retrain_and_optimize:
@@ -23,7 +26,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance joblib requests
+          pip install -r requirements.txt
 
       - name: 1. Run ML Model Training
         run: |
@@ -40,4 +43,4 @@ jobs:
           git add gold_ml_filter.pkl best_config.json
           git commit -m "🤖 Auto-retrained ML model & updated best_config.json [skip ci]" || exit 0
           git push
-          git push
+          
