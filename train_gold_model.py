@@ -1,165 +1,145 @@
-"""
-Gold ML Model Trainer (train_gold_model.py)
-อัปเกรด Advanced Feature Engineering (RSI, DayOfWeek)
-และใช้ class_weight='balanced' ใน RandomForestClassifier
-"""
-
 import os
 import joblib
-import pandas as pd
 import numpy as np
-import yfinance as yf
+import pandas as pd
+import requests
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
 
-SYMBOL = "GC=F"
-MODEL_OUTPUT_PATH = "gold_ml_filter.pkl"
-LOOKBACK_PERIOD = "60d"
-RR_RATIO = 3.0
-SL_BUFFER = 0.80
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+MODEL_FILE = "gold_ml_filter.pkl"
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
 
-def fetch_and_prepare_data():
-    print(f"📥 กำลังดึงข้อมูลราคาทองคำ ({SYMBOL}) ย้อนหลัง {LOOKBACK_PERIOD}...")
-    df_5m = yf.download(SYMBOL, period=LOOKBACK_PERIOD, interval="5m", progress=False)
+def fetch_historical_m5_data(count=500):
+  """ดึงข้อมูลราคาย้อนหลัง M5 สำหรับ XAU/USD"""
+  url = "https://api.twelvedata.com/time_series"
+  params = {
+      "symbol": "XAU/USD",
+      "interval": "5min",
+      "outputsize": count,
+      "apikey": TWELVE_DATA_API_KEY,
+      "format": "JSON",
+      "timezone": "Asia/Bangkok",
+  }
+  try:
+    res = requests.get(url, params=params)
+    data = res.json()
+    if "values" not in data:
+      print("ไม่สามารถดึงข้อมูลได้:", data.get("message"))
+      return pd.DataFrame()
 
-    if isinstance(df_5m.columns, pd.MultiIndex):
-        df_5m.columns = df_5m.columns.get_level_values(0)
+    parsed = []
+    for c in reversed(data["values"]):
+      parsed.append({
+          "time": pd.to_datetime(c["datetime"]),
+          "open": float(c["open"]),
+          "high": float(c["high"]),
+          "low": float(c["low"]),
+          "close": float(c["close"]),
+      })
+    df = pd.DataFrame(parsed).set_index("time")
+    return df
+  except Exception as e:
+    print(f"เกิดข้อผิดพลาด: {e}")
+    return pd.DataFrame()
 
-    df_5m = df_5m.dropna()
-    if len(df_5m) < 200:
-        return None
 
-    # Resampling
-    df_15m = df_5m.resample('15min').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
-    df_1h  = df_5m.resample('1H').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
+def prepare_dataset(df):
+  """คำนวณ Indicators และสร้าง Label สำหรับการเทรน"""
+  if len(df) < 50:
+    return None, None
 
-    df_1h['EMA_50'] = df_1h['Close'].ewm(span=50, adjust=False).mean()
-    df_1h['H1_Trend'] = np.where(df_1h['Close'] > df_1h['EMA_50'], 1, -1)
+  # คำนวณ Features
+  df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
+  delta = df["close"].diff()
+  gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+  loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+  rs = gain / (loss.replace(0, 1e-6))
+  df["rsi"] = 100 - (100 / (1 + rs))
 
-    df_15m['EMA_20'] = df_15m['Close'].ewm(span=20, adjust=False).mean()
-    df_15m['M15_Trend'] = np.where(df_15m['Close'] > df_15m['EMA_20'], 1, -1)
+  features = []
+  labels = []
 
-    df_5m['H1_Trend'] = df_1h['H1_Trend'].reindex(df_5m.index, method='ffill')
-    df_5m['M15_Trend'] = df_15m['M15_Trend'].reindex(df_5m.index, method='ffill')
+  for i in range(2, len(df) - 10):
+    c1 = df.iloc[i - 2]
+    c2 = df.iloc[i - 1]
+    c3 = df.iloc[i]
 
-    # Priority 3 Features: ATR & RSI
-    high_low = df_5m['High'] - df_5m['Low']
-    high_cp  = np.abs(df_5m['High'] - df_5m['Close'].shift(1))
-    low_cp   = np.abs(df_5m['Low'] - df_5m['Close'].shift(1))
-    df_5m['ATR'] = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1).rolling(14).mean()
-    df_5m['RSI'] = calculate_rsi(df_5m['Close'], 14)
+    is_buy = c3["low"] > c1["high"]
+    is_sell = c3["high"] < c1["low"]
 
-    df_5m['Bullish_FVG'] = df_5m['Low'] > df_5m['High'].shift(2)
-    df_5m['Bearish_FVG'] = df_5m['High'] < df_5m['Low'].shift(2)
+    if not (is_buy or is_sell):
+      continue
 
-    return df_5m.dropna()
+    fvg_size = (c3["low"] - c1["high"]) if is_buy else (c1["low"] - c3["high"])
+    entry = c3["close"]
+    sl = (c1["low"] - 1.5) if is_buy else (c1["high"] + 1.5)
+    tp = (
+        entry + (2.0 * abs(entry - sl))
+        if is_buy
+        else entry - (2.0 * abs(entry - sl))
+    )
 
-def create_dataset(df):
-    samples = []
-    for i in range(50, len(df) - 100):
-        latest_bar  = df.iloc[i]
-        prev_bar    = df.iloc[i-1]
-        prev_2_bar  = df.iloc[i-2]
-        latest_time = df.index[i]
+    t = df.index[i]
+    hour = t.hour
+    dayofweek = t.dayofweek
+    risk_dist = abs(entry - sl)
+    atr = df["atr"].iloc[i]
+    rsi = df["rsi"].iloc[i]
 
-        is_long  = (latest_bar['H1_Trend'] == 1) and (latest_bar['M15_Trend'] == 1) and latest_bar['Bullish_FVG']
-        is_short = (latest_bar['H1_Trend'] == -1) and (latest_bar['M15_Trend'] == -1) and latest_bar['Bearish_FVG']
+    if pd.isna(atr) or pd.isna(rsi):
+      continue
 
-        if not (is_long or is_short):
-            continue
+    # ตรวจสอบว่าในอีก 10 แท่งถัดไป ชน TP หรือ SL ก่อนกัน
+    future_candles = df.iloc[i + 1 : i + 11]
+    target = 0
+    for _, fc in future_candles.iterrows():
+      if is_buy:
+        if fc["high"] >= tp:
+          target = 1
+          break
+        if fc["low"] <= sl:
+          target = 0
+          break
+      else:
+        if fc["low"] <= tp:
+          target = 1
+          break
+        if fc["high"] >= sl:
+          target = 0
+          break
 
-        entry_price = float(latest_bar['Close'])
+    features.append([fvg_size, atr, rsi, hour, dayofweek, risk_dist])
+    labels.append(target)
 
-        if is_long:
-            sl_price  = float(min(latest_bar['Low'], prev_bar['Low'])) - SL_BUFFER
-            risk_dist = entry_price - sl_price
-            tp_price  = entry_price + (risk_dist * RR_RATIO)
-            fvg_size  = float(latest_bar['Low'] - prev_2_bar['High'])
-        else:
-            sl_price  = float(max(latest_bar['High'], prev_bar['High'])) + SL_BUFFER
-            risk_dist = sl_price - entry_price
-            tp_price  = entry_price - (risk_dist * RR_RATIO)
-            fvg_size  = float(prev_2_bar['Low'] - latest_bar['High'])
+  return np.array(features), np.array(labels)
 
-        if risk_dist <= 0:
-            continue
-
-        future_bars = df.iloc[i+1 : i+101]
-        label = 0
-
-        for _, f_bar in future_bars.iterrows():
-            if is_long:
-                if f_bar['High'] >= tp_price:
-                    label = 1
-                    break
-                if f_bar['Low'] <= sl_price:
-                    label = 0
-                    break
-            else:
-                if f_bar['Low'] <= tp_price:
-                    label = 1
-                    break
-                if f_bar['High'] >= sl_price:
-                    label = 0
-                    break
-
-        samples.append({
-            'FVG_Size': fvg_size,
-            'ATR': float(latest_bar['ATR']),
-            'RSI': float(latest_bar['RSI']),
-            'Hour': int(latest_time.hour),
-            'DayOfWeek': int(latest_time.dayofweek),
-            'Risk_Distance': risk_dist,
-            'Target': label
-        })
-
-    return pd.DataFrame(samples)
 
 def train_and_save_model():
-    df = fetch_and_prepare_data()
-    if df is None:
-        return
+  print("กำลังดึงข้อมูลเพื่อเทรนโมเดล...")
+  df = fetch_historical_m5_data(500)
+  if df.empty:
+    print("ไม่มีข้อมูลสำหรับเทรน")
+    return
 
-    dataset = create_dataset(df)
-    if dataset.empty or len(dataset) < 30:
-        print("❌ ตัวอย่างข้อมูลมีจำนวนน้อยเกินไปสำหรับการเทรน")
-        return
+  X, y = prepare_dataset(df)
+  if X is None or len(X) < 10:
+    print("ข้อมูลสำหรับเทรนมีน้อยเกินไป")
+    return
 
-    feature_cols = ['FVG_Size', 'ATR', 'RSI', 'Hour', 'DayOfWeek', 'Risk_Distance']
-    X = dataset[feature_cols]
-    y = dataset['Target']
+  print(
+      f"ขนาด Dataset: {len(X)} ตัวอย่าง (Win: {sum(y)}, Loss: {len(y) - sum(y)})"
+  )
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+  # สร้างและฝึกโมเดล Random Forest
+  clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+  clf.fit(X, y)
 
-    print("\n🧠 กำลังเทรนโมเดล Machine Learning (Random Forest Balanced)...")
-    model = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=5,
-        min_samples_split=5,
-        class_weight='balanced',  # แก้ไข Class Imbalance
-        random_state=42
-    )
-    model.fit(X_train, y_train)
+  # บันทึกโมเดล
+  joblib.dump(clf, MODEL_FILE)
+  print(f"✨ บันทึกโมเดลเรียบร้อยแล้วลงไฟล์ '{MODEL_FILE}'")
 
-    y_pred = model.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-
-    print(f"\n🎯 Model Accuracy บน Test Set: {acc*100:.2f}%")
-    print(classification_report(y_test, y_pred, zero_division=0))
-
-    joblib.dump(model, MODEL_OUTPUT_PATH)
-    print(f"💾 บันทึกโมเดลสำเร็จเรียบร้อยที่ไฟล์: '{MODEL_OUTPUT_PATH}'")
 
 if __name__ == "__main__":
-    train_and_save_model()
+  train_and_save_model()
     
