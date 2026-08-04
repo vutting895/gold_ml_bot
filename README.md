@@ -1,19 +1,37 @@
-# Gold ML Real-time Scanner Bot (Cloud Run Job)
+# 🤖 Automated Gold (XAU/USD) SMC + ML Scanner System
 
-โครงสร้างไฟล์โปรเจกต์สำหรับรันบอทสแกนราคาทองคำด้วย Machine Learning และส่งสัญญาณผ่าน Telegram
+ระบบสแกนราคาทองคำอัตโนมัติบนไทม์เฟรม M5 ตามกลยุทธ์ **Smart Money Concept (SMC: Wave 3 + Fair Value Gap)** ร่วมกับการกรองสัญญาณความน่าจะเป็นด้วย **Machine Learning (Random Forest Classifier)** พร้อมระบบส่งสัญญาณเข้า Telegram และ Auto-Retrain อัตโนมัติผ่าน GitHub Actions
 
-## 📁 ไฟล์ภายใน Zip:
-- `gold_realtime_scanner.py` : สคริปต์ Python หลักสำหรับสแกนราคาทองคำ M5
-- `gold_ml_filter.pkl` : ไฟล์โมเดล Machine Learning
-- `Dockerfile` : คอนฟิกสำหรับสร้าง Container บน Cloud Run
-- `requirements.txt` : รายชื่อไลบรารี Python ที่ใช้
-- `deploy.sh` : สคริปต์อัตโนมัติสำหรับสั่ง Deploy ขึ้น GCP Cloud Run Job & Cloud Scheduler
+---
 
-## 🚀 วิธีใช้งานด่วน:
-1. แตกไฟล์ Zip เข้าโฟลเดอร์โปรเจกต์
-2. แก้ไข `TELEGRAM_TOKEN` และ `TELEGRAM_CHAT_ID` ในไฟล์ `gold_realtime_scanner.py`
-3. รันสคริปต์ Deploy บน Google Cloud Shell:
-   ```bash
-   chmod +x deploy.sh
-   ./deploy.sh
-   ```
+## 🌟 ฟีเจอร์หลัก (Key Features)
+
+* **Multi-Timeframe Analysis:** วิเคราะห์แนวโน้มใหญ่ร่วมกันระหว่าง H1 (EMA 50), M15 (EMA 20) และแท่งเทียน M5
+* **SMC Signal Detection:** ตรวจจับพื้นที่เกิด Fair Value Gap (FVG) เพื่อหาจุดเข้าสถิติต่ำ Risk-to-Reward สูง
+* **ML Quality Filter:** ใช้โมเดล Machine Learning คัดกรองสัญญาณที่มีความน่าจะเป็นชนะ (Win Probability) สูงกว่าเกณฑ์ที่กำหนด
+* **Dynamic Position Sizing:** คำนวณขนาด Lot Size อัตโนมัติอิงตามความเสี่ยงพอร์ต (% Risk) และปรับเพิ่มความเสี่ยงเมื่อโมเดลมีความมั่นใจสูง
+* **Auto Parameter Optimization:** ระบบ Grid Search Backtest ค้นหาพารามิเตอร์ R:R Ratio, Stop Loss Buffer และ Probability Threshold ที่ดีที่สุดย้อนหลังอัตโนมัติ
+* **Fully Automated via GitHub Actions:** 
+  * สแกนตลาดฟรีทุกๆ 5 นาที (ไม่ต้องเปิดคอมทิ้งไว้)
+  * เทรนโมเดล ML ใหม่และอัปเดตไฟล์คอนฟิกอัตโนมัติทุกสัปดาห์
+
+---
+
+## 📂 โครงสร้างโฟลเดอร์โปรเจกต์ (Project Structure)
+
+```text
+.
+├── .github/
+│   └── workflows/
+│       ├── gold_scanner.yml          # [Workflow] สแกนราคา Real-time ทุก 5 นาที
+│       └── retrain_and_optimize.yml  # [Workflow] เทรนโมเดล & หา Config ใหม่ทุกวันอาทิตย์
+├── .gitignore                        # ไฟล์ยกเว้นขยะ/แคช
+├── README.md                         # คู่มือการใช้งานระบบ
+├── requirements.txt                  # รายชื่อ Python Dependencies
+├── best_config.json                  # ไฟล์เก็บค่า Config ที่ได้จากการ Auto-Optimize
+├── gold_ml_filter.pkl                # ไฟล์โมเดล Machine Learning
+├── auto_backtest_optimizer.py        # สคริปต์ Backtest & Grid Search
+├── train_gold_model.py               # สคริปต์เทรนโมเดล ML
+├── scanner.py                        # สคริปต์ Real-time Scanner หลัก
+├── gold_realtime_scanner.py          # สคริปต์ Real-time Scanner (เวอร์ชันสมบูรณ์)
+└── deploy.sh                         # สคริปต์ Shell สำหรับ Auto Git Commit & Push
