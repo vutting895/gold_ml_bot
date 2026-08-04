@@ -1,0 +1,33 @@
+name: Gold ML Realtime Scanner
+
+on:
+  schedule:
+    # รันทุกๆ 5 นาที (จันทร์ - ศุกร์)
+    - cron: '*/5 * * * 1-5'
+  workflow_dispatch: # ปุ่มสำหรับกดสั่งรันด้วยตัวเองเพื่อทดสอบ
+
+jobs:
+  scan-gold:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. ดึงโค้ดจาก Repository
+        uses: actions/checkout@v4
+
+      - name: 2. ติดตั้ง Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 3. ติดตั้ง Libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. สั่งรันสคริปต์สแกนราคาทองคำ
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python gold_realtime_scanner.py
+          
