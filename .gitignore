@@ -4,3 +4,7 @@ __pycache__/
 venv/
 .vscode/
 .idea/
+# Cache & State
+last_signal.json
+__pycache__/
+*.pyc
