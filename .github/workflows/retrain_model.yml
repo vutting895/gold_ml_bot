@@ -1,37 +1,43 @@
-name: Auto Retrain Gold ML Model
+name: Retrain Model & Auto-Optimize Config
 
 on:
   schedule:
-    # รันทุกวันจันทร์ - ศุกร์ เวลา 04:00 น. (เวลาไทย) / 21:00 UTC (วันอาทิตย์ - พฤหัสบดี)
-    - cron: '0 21 * * 0-4'
-  workflow_dispatch: # ปุ่มกดสั่งเทรนด้วยตัวเอง
+    - cron: '0 0 * * 0'   # ⏰ รันทุกวันอาทิตย์ เวลา 00:00 UTC (ช่วงตลาดปิด)
+  workflow_dispatch:      # 🔘 ปุ่มกดรันมือบน GitHub
 
 jobs:
-  retrain:
+  retrain_and_optimize:
+    name: Retrain ML & Optimize Config
     runs-on: ubuntu-latest
 
     steps:
-      - name: 1. Checkout Code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: 2. Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      - name: 3. Install Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy yfinance joblib requests
 
-      - name: 4. Run Model Training
+      - name: 1. Run ML Model Training
         run: |
           python train_gold_model.py
 
-      - name: 5. Commit & Push Updated Model File
+      - name: 2. Run Auto Backtest Optimization
+        run: |
+          python auto_backtest_optimizer.py
+
+      - name: 3. Commit & Push Updated Model and Config
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Bot"
-          git add gold_ml_filter.pkl
-          git commit -m "🤖 Auto-retrained ML model with latest market data [skip ci]" || exit 0
+          git add gold_ml_filter.pkl best_config.json
+          git commit -m "🤖 Auto-retrained ML model & updated best_config.json [skip ci]" || exit 0
+          git push
           git push
