@@ -77,10 +77,14 @@ def send_telegram_alert(message):
 
 
 def log_to_google_sheet(row_data):
-  """บันทึกข้อมูลสัญญาณลง Google Sheets"""
+  """บันทึกข้อมูลสัญญาณลง Google Sheets
+
+  พร้อมตรวจสอบและสร้าง Worksheet และ Header อัตโนมัติ
+  """
   if not GOOGLE_CREDENTIALS_JSON:
     print("ไม่พบข้อมูล Google Credentials JSON")
     return
+
   try:
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     scope = [
@@ -89,10 +93,39 @@ def log_to_google_sheet(row_data):
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     client = gspread.authorize(creds)
-    sheet = client.open(GOOGLE_SHEET_NAME).worksheet("Signals")
+
+    # 1. เปิด Google Spreadsheet ตามชื่อที่กำหนด
+    try:
+      spreadsheet = client.open(GOOGLE_SHEET_NAME)
+    except gspread.exceptions.SpreadsheetNotFound:
+      print(
+          f"❌ ไม่พบ Spreadsheet ชื่อ '{GOOGLE_SHEET_NAME}'"
+          " กรุณาสร้างไฟล์ Google Sheets และแชร์สิทธิ์ให้ Service Account"
+          " เรียบร้อยแล้ว"
+      )
+      return
+
+    # 2. ตรวจสอบว่ามี Worksheet ชื่อ "Signals" หรือยัง ถ้ายังให้สร้างอัตโนมัติ
+    try:
+      sheet = spreadsheet.worksheet("Signals")
+    except gspread.exceptions.WorksheetNotFound:
+      sheet = spreadsheet.add_worksheet(title="Signals", rows="1000", cols="10")
+      print('✨ สร้าง Worksheet "Signals" ให้อัตโนมัติสำเร็จ')
+
+    # 3. ตรวจสอบว่ามี Header หรือยัง ถ้าตารางว่าง ให้เพิ่ม Header อัตโนมัติทันที
+    existing_data = sheet.get_all_values()
+    if not existing_data:
+      headers = ["Time", "Type", "Entry", "SL", "TP", "Status", "PnL"]
+      sheet.append_row(headers)
+      print("✨ เพิ่มตาราง Header อัตโนมัติสำเร็จ (Time, Type, Entry, SL, TP, Status, PnL)")
+
+    # 4. บันทึกข้อมูลแถวใหม่ (Row Data) ลงในตาราง
     sheet.append_row(row_data)
+    print("📥 บันทึกข้อมูลสัญญาณลง Google Sheets สำเร็จ")
+
   except Exception as e:
-    print(f"เกิดข้อผิดพลาดในการบันทึก Google Sheets: {e}")
+    print(f"⚠️ เกิดข้อผิดพลาดในการจัดการ Google Sheets: {e}")
+
 
 
 def load_state():
