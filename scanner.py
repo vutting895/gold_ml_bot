@@ -1,13 +1,14 @@
 """
 Gold Real-time Scanner (scanner.py)
 สคริปต์สแกนราคาทองคำ Real-time M5 SMC (Wave 3 + FVG)
-ระบบสมบูรณ์แบบ:
+ระบบสมบูรณ์แบบระดับ Production:
  1. Signal Deduplication & State Management (ป้องกันการส่งสัญญาณซ้ำ)
  2. Multi-Provider Data Fallback (yfinance -> Twelve Data -> Alpha Vantage)
  3. Economic News Filter (งดเทรดช่วงข่าว High Impact USD/XAU ก่อน-หลัง 30 นาที)
  4. Daily Rollover Guard (งดสแกนช่วง 04:00 - 05:30 น. เวลาไทย)
- 5. ML Filtering & Dynamic Lot Scaling
- 6. Risk-Free Mechanism (Break-Even Trigger at 50% TP)
+ 5. Google Sheets Real-time Logging (บันทึกข้อมูลสำหรับ Forward Test Dashboard)
+ 6. ML Filtering & Dynamic Lot Scaling
+ 7. Risk-Free Mechanism (Break-Even Trigger at 50% TP)
 """
 
 import os
@@ -20,15 +21,24 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
 
+# Google Sheets Libraries (Optional/Graceful Fallback)
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
+
 # ==================== CONFIGURATION ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE"))
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
 MODEL_FILE_PATH    = os.getenv("MODEL_FILE_PATH", "gold_ml_filter.pkl")
 CONFIG_FILE_PATH   = os.getenv("CONFIG_FILE_PATH", "best_config.json")
 LAST_SIGNAL_PATH   = "last_signal.json"
+GOOGLE_SHEET_NAME  = os.getenv("GOOGLE_SHEET_NAME", "Gold_Trading_Logs")
 
 # API Keys สำหรับ Provider สำรอง (ใส่ใน GitHub Secrets หรือ Environment Variables)
-TWELVE_DATA_API_KEY  = os.getenv("TWELVE_DATA_API_KEY", "")
+TWELVE_DATA_API_KEY   = os.getenv("TWELVE_DATA_API_KEY", "")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 
 SYMBOL              = "GC=F"
@@ -102,19 +112,16 @@ def fetch_gold_data_alphavantage() -> pd.DataFrame:
 
 def get_gold_market_data() -> pd.DataFrame:
     """ ระบบ Fallback ลำดับชั้นสำหรับดึงข้อมูลราคา """
-    # Try 1: yfinance
     try:
         return fetch_gold_data_yfinance()
     except Exception as e:
         print(f"⚠️ yfinance ล้มเหลว/ถูกบล็อก: {e}")
     
-    # Try 2: Twelve Data
     try:
         return fetch_gold_data_twelvedata()
     except Exception as e:
         print(f"⚠️ Twelve Data ล้มเหลว: {e}")
 
-    # Try 3: Alpha Vantage
     try:
         return fetch_gold_data_alphavantage()
     except Exception as e:
@@ -139,7 +146,11 @@ def save_last_signal(signal_time_str: str, signal_type: str):
     """ บันทึก State สัญญาณล่าสุดลงไฟล์ JSON """
     try:
         with open(LAST_SIGNAL_PATH, "w", encoding="utf-8") as f:
-            json.dump({"time": signal_time_str, "type": signal_type, "updated_at": datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
+            json.dump({
+                "time": signal_time_str, 
+                "type": signal_type, 
+                "updated_at": datetime.now().isoformat()
+            }, f, ensure_ascii=False, indent=2)
         print(f"💾 บันทึก State สัญญาณสำเร็จ: {signal_time_str} ({signal_type})")
     except Exception as e:
         print(f"⚠️ ไม่สามารถบันทึก State ได้: {e}")
@@ -183,6 +194,47 @@ def is_high_impact_news_near(buffer_minutes: int = 30) -> tuple[bool, str]:
     except Exception as e:
         print(f"⚠️ ไม่สามารถดึงข้อมูลข่าวได้ ({e}) -> สแกนต่อตามปกติโดยไม่ใช้ News Filter")
     return False, ""
+
+# ==================== 5. GOOGLE SHEETS LOGGING ====================
+def log_signal_to_google_sheet(timestamp, signal_type, entry, sl, tp, be_trigger, win_prob):
+    """ บันทึกสัญญาณการเทรดลง Google Sheets สำหรับ Forward Test """
+    if not GSPREAD_AVAILABLE:
+        print("ℹ️ ไม่พบกิติกรรม gspread/oauth2client -> Skip การบันทึก Google Sheet")
+        return
+
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        
+        if creds_json:
+            creds_dict = json.loads(creds_json)
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        elif os.path.exists("google_credentials.json"):
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(json.load(open("google_credentials.json")), scope)
+        else:
+            print("ℹ️ ไม่พบ Google Credentials -> Skip การบันทึก Sheet")
+            return
+
+        client = gspread.authorize(creds)
+        sheet = client.open(GOOGLE_SHEET_NAME).worksheet("Signals")
+
+        row = [
+            timestamp,
+            signal_type,
+            entry,
+            sl,
+            tp,
+            be_trigger,
+            f"{win_prob*100:.1f}%",
+            "OPEN",  # Status
+            0.0,     # Exit_Price
+            0.0      # PnL
+        ]
+        
+        sheet.append_row(row)
+        print("📊 บันทึกสัญญาณลง Google Sheets เรียบร้อยแล้ว")
+    except Exception as e:
+        print(f"⚠️ ไม่สามารถบันทึกข้อมูลลง Google Sheet ได้: {e}")
 
 # ==================== HELPER FUNCTIONS ====================
 def load_auto_config():
@@ -355,6 +407,7 @@ def run_scanner():
             print(alert_msg)
             send_telegram_alert(alert_msg)
             save_last_signal(latest_time_str, signal_type)
+            log_signal_to_google_sheet(latest_time_str, signal_type, entry_price, sl_price, tp_price, be_trigger, win_prob)
         else:
             print(f"⛔ สัญญาณถูกปฏิเสธเนื่องจากความมั่นใจ ML ({win_prob*100:.1f}%) ต่ำกว่าเกณฑ์")
 
@@ -363,4 +416,4 @@ def run_scanner():
 
 if __name__ == "__main__":
     run_scanner()
-        
+ 
