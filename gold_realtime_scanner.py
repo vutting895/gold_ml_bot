@@ -8,8 +8,8 @@ import yfinance as yf
 from datetime import datetime, time as dtime
 
 # ==================== 1. TELEGRAM & MODEL CONFIGURATION ====================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8885362745:AAFoKfUJmdFsiGBGP7XnaXzFqWa2LLFp_UQ")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "2087901601")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
 MODEL_FILE_PATH = os.getenv("MODEL_FILE_PATH", "gold_ml_filter.pkl")
 
 SYMBOL = "GC=F"              # Gold Futures / Spot Gold (XAUUSD)
@@ -137,33 +137,23 @@ def scan_gold_market():
             lot_size = math.floor((ACCOUNT_EQUITY * RISK_PCT) / (risk_dist * 100) * 100) / 100.0
             lot_size = max(0.01, lot_size)
 
-            alert_msg = (
-                f"🚨 *SIGNAL ALERT: XAU/USD ({signal_type})*
-"
-                f"━━━━━━━━━━━━━━━━━━━━
-"
-                f"🤖 *ML Win Probability:* `{win_prob*100:.1f}%` (Passed Filter)
-"
-                f"📍 *Entry Price:* `${entry_price:,.2f}`
-"
-                f"🛑 *Stop Loss (SL):* `${sl_price:,.2f}` (`${risk_dist:.2f}` Risk)
-"
-                f"🎯 *Take Profit (TP):* `${tp_price:,.2f}` (R:R 1:{RR_RATIO})
-"
-                f"⚖️ *Recommended Lot:* `{lot_size}` Lot (Risk 1%)
-"
-                f"⏰ *Time:* `{latest_time.strftime('%Y-%m-%d %H:%M')}`
-"
-                f"━━━━━━━━━━━━━━━━━━━━
-"
-                f"💡 _ยกระดับด้วย H1-M15-M5 SMC + ML Filter_"
-            )
+            alert_msg = f"""🚨 *SIGNAL ALERT: XAU/USD ({signal_type})*
+━━━━━━━━━━━━━━━━━━━━
+🤖 *ML Win Probability:* `{win_prob*100:.1f}%` (Passed Filter)
+📍 *Entry Price:* `${entry_price:,.2f}`
+🛑 *Stop Loss (SL):* `${sl_price:,.2f}` (`${risk_dist:.2f}` Risk)
+🎯 *Take Profit (TP):* `${tp_price:,.2f}` (R:R 1:{RR_RATIO})
+⚖️ *Recommended Lot:* `{lot_size}` Lot (Risk 1%)
+⏰ *Time:* `{latest_time.strftime('%Y-%m-%d %H:%M')}`
+━━━━━━━━━━━━━━━━━━━━
+💡 _ยกระดับด้วย H1-M15-M5 SMC + ML Filter_"""
+
             send_telegram_alert(alert_msg)
 
     except Exception as e:
         print(f"⚠️ เกิดข้อผิดพลาดขณะสแกนตลาด: {e}")
 
 if __name__ == "__main__":
-    print("🚀 เริ่มสแกนราคาทองคำสำหรับ Cloud Run Job...")
+    print("🚀 เริ่มสแกนราคาทองคำสำหรับ Cloud Run / GitHub Actions...")
     scan_gold_market()
     print("🏁 สแกนเสร็จสิ้น ปิดการทำงาน Job")
