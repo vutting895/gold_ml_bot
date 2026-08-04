@@ -2,66 +2,33 @@ name: Gold Real-time M5 Scanner
 
 on:
   schedule:
-    # รันสแกนอัตโนมัติทุกๆ 5 นาที
+    # รันทุกๆ 5 นาที (นาทีที่หารด้วย 5 ลงตัว)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # ปุ่มสำหรับกดรันสั่งงานเองด้วยตนเองผ่านหน้าเว็บ GitHub
+  workflow_dispatch: # ปุ่มกดรันเองผ่านหน้าเว็บ GitHub
 
 jobs:
   scan:
-    name: Run Gold Scanner & Sync State
     runs-on: ubuntu-latest
-    
-    # ให้สิทธิ์ GitHub Actions ในการเขียนไฟล์ลง Repository (จำเป็นสำหรับการเซฟ last_signal.json)
-    permissions:
-      contents: write
-
     steps:
-      # 1. ดึงโค้ดจาก Repository
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true # อนุญาตให้ใช้ Token ในการ Push โค้ดกลับ
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
-      # 2. ติดตั้ง Python เวอร์ชัน 3.10
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/checkout@v3
         with:
           python-version: '3.10'
-          cache: 'pip' # ช่วยแคชไลบรารีเพื่อลดเวลาติดตั้งในรอบถัดไป
 
-      # 3. ติดตั้ง Dependencies จาก requirements.txt
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      # 4. รันสคริปต์สแกนราคาทองคำ
-      - name: Run Gold Real-time Scanner
+      - name: Run Gold Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          GOOGLE_SHEET_NAME: "Gold_Trading_Logs"
-          ACCOUNT_EQUITY: "10000.0"
-          RISK_PCT: "0.01"
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
         run: python scanner.py
-
-      # 5. บันทึกและ Push ไฟล์ last_signal.json กลับเข้า Repository เพื่อทำ State Management
-      - name: Commit and Push State Management (Prevent Duplicate Alerts)
-        if: always() # ให้ทำงานเสมอไม่ว่าจะสแกนเจอสัญญาณหรือไม่
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
-          # ดึงโค้ดล่าสุดก่อนเพื่อป้องกัน Conflict
-          git pull origin main --rebase || true
-          
-          # ตรวจสอบการเปลี่ยนแปลงของไฟล์ last_signal.json
-          if [ -f last_signal.json ]; then
-            git add last_signal.json
-            git commit -m "chore(state): sync last_signal.json state [skip ci]" || echo "ไม่มีการเปลี่ยนแปลงใน last_signal.json"
-            git push origin main || echo "ไม่มีการเปลี่ยนแปลงที่ต้อง Push"
-          fi
-          
+        
