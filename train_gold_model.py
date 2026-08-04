@@ -127,7 +127,7 @@ def create_dataset(df):
         })
 
     dataset = pd.DataFrame(samples)
-    print(f"✅ พบข้อมูลการเทรด SMC ย้อนหลังทั้งหมด {len(dataset)} ตัวอย่าง")
+    print(f"✅ พบข้อมูลการเทรน SMC ย้อนหลังทั้งหมด {len(dataset)} ตัวอย่าง")
     if len(dataset) > 0:
         win_rate = (dataset['Target'].sum() / len(dataset)) * 100
         print(f"📈 Raw Signal Win Rate (ก่อน ML Filter): {win_rate:.2f}%")
