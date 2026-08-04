@@ -2,8 +2,8 @@ name: Run Gold M5 Scanner
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # ⏰ รันทุกๆ 5 นาที
-  workflow_dispatch:      # 🔘 ปุ่มกดรันมือบน GitHub
+    - cron: '*/5 * * * *'  # ⏰ รันอัตโนมัติทุกๆ 5 นาที
+  workflow_dispatch:      # 🔘 ปุ่มกดสั่งรันด้วยมือบนหน้าเว็บ GitHub
 
 jobs:
   scan_market:
@@ -23,7 +23,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance joblib requests
+          pip install -r requirements.txt
 
       - name: Run Scanner Script
         env:
@@ -31,7 +31,4 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python scanner.py
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python scanner.py
+          
