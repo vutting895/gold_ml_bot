@@ -1,0 +1,22 @@
+{
+  "version": "1.0",
+  "policy_name": "github_actions_execution_policy",
+  "description": "Policy defining allowed actions and execution permissions for the repository.",
+  "actions_permissions": {
+    "allowed_actions": "selected",
+    "allow_github_owned_actions": true,
+    "allow_verified_marketplace_actions": false,
+    "allowed_patterns": [
+      "actions/checkout@v4",
+      "actions/setup-python@v5"
+    ]
+  },
+  "workflow_permissions": {
+    "default_workflow_permissions": "write",
+    "can_approve_pull_request_reviews": false
+  },
+  "execution_rules": {
+    "allow_fork_pull_requests": false,
+    "require_approval_for_external_contributors": "all"
+  }
+}
