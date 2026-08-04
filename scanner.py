@@ -1,7 +1,13 @@
 """
 Gold Real-time Scanner (scanner.py)
 สคริปต์สแกนราคาทองคำ Real-time M5 SMC (Wave 3 + FVG)
-พร้อมระบบ Deduplication (กันสัญญาณซ้ำ), News Filter และ ML Model Filtering
+ระบบสมบูรณ์แบบ:
+ 1. Signal Deduplication & State Management (ป้องกันการส่งสัญญาณซ้ำ)
+ 2. Multi-Provider Data Fallback (yfinance -> Twelve Data -> Alpha Vantage)
+ 3. Economic News Filter (งดเทรดช่วงข่าว High Impact USD/XAU ก่อน-หลัง 30 นาที)
+ 4. Daily Rollover Guard (งดสแกนช่วง 04:00 - 05:30 น. เวลาไทย)
+ 5. ML Filtering & Dynamic Lot Scaling
+ 6. Risk-Free Mechanism (Break-Even Trigger at 50% TP)
 """
 
 import os
@@ -12,7 +18,7 @@ import joblib
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE"))
@@ -21,15 +27,139 @@ MODEL_FILE_PATH    = os.getenv("MODEL_FILE_PATH", "gold_ml_filter.pkl")
 CONFIG_FILE_PATH   = os.getenv("CONFIG_FILE_PATH", "best_config.json")
 LAST_SIGNAL_PATH   = "last_signal.json"
 
+# API Keys สำหรับ Provider สำรอง (ใส่ใน GitHub Secrets หรือ Environment Variables)
+TWELVE_DATA_API_KEY  = os.getenv("TWELVE_DATA_API_KEY", "")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+
 SYMBOL              = "GC=F"
 ACCOUNT_EQUITY      = float(os.getenv("ACCOUNT_EQUITY", "10000.0"))
 BASE_RISK_PCT       = float(os.getenv("RISK_PCT", "0.01"))
 DYNAMIC_LOT_SCALING = True
 
-# ==================== PRIORITY 2: NEWS FILTER ====================
+# ==================== 1. MULTI-PROVIDER DATA FETCHING ====================
+def fetch_gold_data_yfinance() -> pd.DataFrame:
+    """ Primary Provider: Yahoo Finance """
+    print("📡 [1/3] กำลังดึงข้อมูลจาก Yahoo Finance...")
+    df = yf.download(SYMBOL, period="5d", interval="5m", progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna()
+    if len(df) < 50:
+        raise ValueError("ข้อมูลจาก yfinance ไม่ครบถ้วน")
+    return df
+
+def fetch_gold_data_twelvedata() -> pd.DataFrame:
+    """ Secondary Provider: Twelve Data API """
+    if not TWELVE_DATA_API_KEY:
+        raise ValueError("ไม่ได้ตั้งค่า TWELVE_DATA_API_KEY")
+    
+    print("📡 [2/3] กำลังดึงข้อมูลสำรองจาก Twelve Data API...")
+    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=500&apikey={TWELVE_DATA_API_KEY}"
+    res = requests.get(url, timeout=10).json()
+    
+    if "values" not in res:
+        raise ValueError(f"Twelve Data Error: {res.get('message', 'Unknown Error')}")
+    
+    data = res["values"]
+    df = pd.DataFrame(data)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.set_index('datetime').sort_index()
+    
+    for col in ['open', 'high', 'low', 'close']:
+        df[col] = df[col].astype(float)
+        
+    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
+    return df
+
+def fetch_gold_data_alphavantage() -> pd.DataFrame:
+    """ Tertiary Provider: Alpha Vantage API """
+    if not ALPHA_VANTAGE_API_KEY:
+        raise ValueError("ไม่ได้ตั้งค่า ALPHA_VANTAGE_API_KEY")
+        
+    print("📡 [3/3] กำลังดึงข้อมูลสำรองจาก Alpha Vantage API...")
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=XAUUSD&interval=5min&extended_hours=false&apikey={ALPHA_VANTAGE_API_KEY}"
+    res = requests.get(url, timeout=10).json()
+    
+    time_series_key = "Time Series (5min)"
+    if time_series_key not in res:
+        raise ValueError("Alpha Vantage Rate Limit หรือ Error")
+        
+    data = res[time_series_key]
+    df = pd.DataFrame.from_dict(data, orient='index')
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    
+    df = df.rename(columns={
+        '1. open': 'Open',
+        '2. high': 'High',
+        '3. low': 'Low',
+        '4. close': 'Close'
+    })
+    for col in ['Open', 'High', 'Low', 'Close']:
+        df[col] = df[col].astype(float)
+        
+    return df
+
+def get_gold_market_data() -> pd.DataFrame:
+    """ ระบบ Fallback ลำดับชั้นสำหรับดึงข้อมูลราคา """
+    # Try 1: yfinance
+    try:
+        return fetch_gold_data_yfinance()
+    except Exception as e:
+        print(f"⚠️ yfinance ล้มเหลว/ถูกบล็อก: {e}")
+    
+    # Try 2: Twelve Data
+    try:
+        return fetch_gold_data_twelvedata()
+    except Exception as e:
+        print(f"⚠️ Twelve Data ล้มเหลว: {e}")
+
+    # Try 3: Alpha Vantage
+    try:
+        return fetch_gold_data_alphavantage()
+    except Exception as e:
+        print(f"⚠️ Alpha Vantage ล้มเหลว: {e}")
+
+    raise RuntimeError("❌ ทุก Provider ล้มเหลวในการดึงข้อมูลราคา ไม่สามารถสแกนกราฟได้")
+
+# ==================== 2. STATE MANAGEMENT & DEDUPLICATION ====================
+def is_duplicate_signal(signal_time_str: str, signal_type: str) -> bool:
+    """ เช็กว่าแท่งเทียน ณ เวลา signal_time_str เคยถูกแจ้งเตือนไปแล้วหรือยัง """
+    if os.path.exists(LAST_SIGNAL_PATH):
+        try:
+            with open(LAST_SIGNAL_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("time") == signal_time_str and data.get("type") == signal_type:
+                    return True
+        except Exception as e:
+            print(f"⚠️ ไม่สามารถอ่าน {LAST_SIGNAL_PATH}: {e}")
+    return False
+
+def save_last_signal(signal_time_str: str, signal_type: str):
+    """ บันทึก State สัญญาณล่าสุดลงไฟล์ JSON """
+    try:
+        with open(LAST_SIGNAL_PATH, "w", encoding="utf-8") as f:
+            json.dump({"time": signal_time_str, "type": signal_type, "updated_at": datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
+        print(f"💾 บันทึก State สัญญาณสำเร็จ: {signal_time_str} ({signal_type})")
+    except Exception as e:
+        print(f"⚠️ ไม่สามารถบันทึก State ได้: {e}")
+
+# ==================== 3. ROLLOVER & HIGH SPREAD GUARD ====================
+def is_market_rollover_time() -> tuple[bool, str]:
+    utc_now = datetime.now(timezone.utc)
+    th_now = utc_now + timedelta(hours=7)
+    current_time = th_now.time()
+
+    start_time = datetime.strptime("04:00", "%H:%M").time()
+    end_time   = datetime.strptime("05:30", "%H:%M").time()
+
+    if start_time <= current_time <= end_time:
+        return True, f"ช่วงตลาดปิดประจำวัน/Spread ถ่างสูง ({th_now.strftime('%H:%M')} น. BKK)"
+    return False, ""
+
+# ==================== 4. ECONOMIC NEWS FILTER ====================
 def is_high_impact_news_near(buffer_minutes: int = 30) -> tuple[bool, str]:
-    """ ดึงข้อมูลปฏิทินข่าว High Impact (USD/XAU) จาก Forex Factory และตรวจสอบช่วงเวลาใกล้ข่าว """
-    url = "https://nfp.ourforecast.com/api/v1/forexfactory"  # API ปฏิทินข่าวสาธารณะ
+    url = "https://nfp.ourforecast.com/api/v1/forexfactory"
     try:
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
@@ -37,39 +167,22 @@ def is_high_impact_news_near(buffer_minutes: int = 30) -> tuple[bool, str]:
             now_utc = datetime.now(timezone.utc)
 
             for event in events:
-                if event.get("currency") in ["USD", "XAU"] and event.get("impact") == "High":
-                    event_time_str = event.get("date")  # ISO Format
+                currency = str(event.get("currency", "")).upper()
+                impact   = str(event.get("impact", "")).capitalize()
+
+                if currency in ["USD", "XAU"] and impact == "High":
+                    event_time_str = event.get("date")
                     if event_time_str:
                         event_dt = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
-                        time_diff = abs((event_dt - now_utc).total_seconds() / 60.0)
+                        time_diff_minutes = (event_dt - now_utc).total_seconds() / 60.0
                         
-                        if time_diff <= buffer_minutes:
-                            title = event.get('title', 'High Impact News')
-                            return True, f"{title} ({event.get('currency')})"
+                        if abs(time_diff_minutes) <= buffer_minutes:
+                            title = event.get('title', 'High Impact Economic News')
+                            status = "กำลังจะออกในอีก" if time_diff_minutes > 0 else "เพิ่งออกไปเมื่อ"
+                            return True, f"{title} ({currency}) [{status} {abs(int(time_diff_minutes))} นาที]"
     except Exception as e:
-        print(f"⚠️ ไม่สามารถเชื่อมต่อ API ข่าวได้ ({e}) -> ดำเนินการสแกนต่อตามปกติ")
+        print(f"⚠️ ไม่สามารถดึงข้อมูลข่าวได้ ({e}) -> สแกนต่อตามปกติโดยไม่ใช้ News Filter")
     return False, ""
-
-# ==================== PRIORITY 1: SIGNAL DEDUPLICATION ====================
-def is_duplicate_signal(signal_time_str: str, signal_type: str) -> bool:
-    """ ตรวจสอบว่าสัญญาณบนแท่งเวลาและทิศทางนี้เคยส่งไปแล้วหรือยัง """
-    if os.path.exists(LAST_SIGNAL_PATH):
-        try:
-            with open(LAST_SIGNAL_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if data.get("time") == signal_time_str and data.get("type") == signal_type:
-                    return True
-        except Exception:
-            pass
-    return False
-
-def save_last_signal(signal_time_str: str, signal_type: str):
-    """ บันทึกสัญญาณล่าสุดลงไฟล์เพื่อกันส่งซ้ำ """
-    try:
-        with open(LAST_SIGNAL_PATH, "w", encoding="utf-8") as f:
-            json.dump({"time": signal_time_str, "type": signal_type}, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ ไม่สามารถบันทึก last_signal.json ได้: {e}")
 
 # ==================== HELPER FUNCTIONS ====================
 def load_auto_config():
@@ -122,28 +235,30 @@ def run_scanner():
     current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n🔍 [{current_time_str}] สแกนกราฟ M5 (Threshold: {proba_threshold*100:.0f}%)...")
 
-    # Priority 2: ตรวจสอบปฏิทินข่าวใหญ่
+    # 1. ROLLOVER GUARD
+    is_rollover, rollover_msg = is_market_rollover_time()
+    if is_rollover:
+        print(f"🛑 [ROLLOVER GUARD] งดสแกนเนื่องจากเป็นช่วง: {rollover_msg}")
+        return
+
+    # 2. ECONOMIC NEWS FILTER
     has_news, news_title = is_high_impact_news_near(buffer_minutes=30)
     if has_news:
         print(f"🛑 [NEWS FILTER] งดสแกนสัญญาณเนื่องจากใกล้ช่วงข่าวใหญ่: {news_title}")
         return
 
+    # 3. MODEL CHECK
     if not os.path.exists(MODEL_FILE_PATH):
         print(f"❌ ไม่พบไฟล์โมเดลที่ Path: {MODEL_FILE_PATH}")
         return
 
     try:
         model = joblib.load(MODEL_FILE_PATH)
-        df_5m = yf.download(SYMBOL, period="5d", interval="5m", progress=False)
-        if isinstance(df_5m.columns, pd.MultiIndex):
-            df_5m.columns = df_5m.columns.get_level_values(0)
+        
+        # 4. DATA FETCH WITH FALLBACK MECHANISM
+        df_5m = get_gold_market_data()
 
-        df_5m = df_5m.dropna()
-        if len(df_5m) < 50:
-            print("❌ ข้อมูลไม่เพียงพอสำหรับประมวลผล")
-            return
-
-        # Technical Indicators
+        # Trend & Indicators
         df_15m = df_5m.resample('15min').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
         df_1h  = df_5m.resample('1H').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
 
@@ -156,7 +271,6 @@ def run_scanner():
         df_5m['H1_Trend'] = df_1h['H1_Trend'].reindex(df_5m.index, method='ffill')
         df_5m['M15_Trend'] = df_15m['M15_Trend'].reindex(df_5m.index, method='ffill')
 
-        # ATR & RSI (Features)
         high_low = df_5m['High'] - df_5m['Low']
         high_cp  = np.abs(df_5m['High'] - df_5m['Close'].shift(1))
         low_cp   = np.abs(df_5m['Low'] - df_5m['Close'].shift(1))
@@ -180,27 +294,32 @@ def run_scanner():
 
         signal_type = "BUY 🟢" if is_long else "SELL 🔴"
 
-        # Priority 1: ตรวจสอบการส่งซ้ำ
+        # 5. SIGNAL DEDUPLICATION CHECK
         if is_duplicate_signal(latest_time_str, signal_type):
             print(f"ℹ️ สัญญาณ {signal_type} ของแท่ง {latest_time_str} เคยถูกส่งไปแล้ว (Skip Duplicate)")
             return
 
         entry_price = float(latest_bar['Close'])
+        be_buffer   = 0.30
+        
         if is_long:
-            sl_price  = float(min(latest_bar['Low'], prev_bar['Low'])) - sl_buffer
-            risk_dist = entry_price - sl_price
-            tp_price  = entry_price + (risk_dist * rr_ratio)
-            fvg_size  = float(latest_bar['Low'] - df_5m.iloc[-4]['High'])
+            sl_price   = float(min(latest_bar['Low'], prev_bar['Low'])) - sl_buffer
+            risk_dist  = entry_price - sl_price
+            tp_price   = entry_price + (risk_dist * rr_ratio)
+            be_trigger = entry_price + (risk_dist * rr_ratio * 0.5)
+            be_sl      = entry_price + be_buffer
+            fvg_size   = float(latest_bar['Low'] - df_5m.iloc[-4]['High'])
         else:
-            sl_price  = float(max(latest_bar['High'], prev_bar['High'])) + sl_buffer
-            risk_dist = sl_price - entry_price
-            tp_price  = entry_price - (risk_dist * rr_ratio)
-            fvg_size  = float(df_5m.iloc[-4]['Low'] - latest_bar['High'])
+            sl_price   = float(max(latest_bar['High'], prev_bar['High'])) + sl_buffer
+            risk_dist  = sl_price - entry_price
+            tp_price   = entry_price - (risk_dist * rr_ratio)
+            be_trigger = entry_price - (risk_dist * rr_ratio * 0.5)
+            be_sl      = entry_price - be_buffer
+            fvg_size   = float(df_5m.iloc[-4]['Low'] - latest_bar['High'])
 
         if risk_dist <= 0:
             return
 
-        # Feature Set ที่ตรงกับ train_gold_model.py
         features = pd.DataFrame([{
             'FVG_Size': fvg_size,
             'ATR': float(latest_bar['ATR']),
@@ -224,14 +343,18 @@ def run_scanner():
                 f"🛑 *Stop Loss (SL):* `${sl_price:,.2f}` (`${risk_dist:.2f}` Risk)\n"
                 f"🎯 *Take Profit (TP):* `${tp_price:,.2f}` (R:R 1:{rr_ratio})\n"
                 f"⚖️ *Recommended Lot:* `{lot_size}` Lot (Risk {risk_pct_used:.1f}%)\n"
-                f"⏰ *Time:* `{latest_time_str}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💡 _ยกระดับด้วย H1-M15-M5 SMC + Deduplication & News Filter_"
+                f"🛡️ *RISK-FREE MECHANISM (Break-Even):*\n"
+                f" 🔹 *BE Trigger (50% TP):* `${be_trigger:,.2f}`\n"
+                f" 🔹 *Action:* ถ้าราคาถึง BE Trigger ให้เลื่อน SL มาที่ `${be_sl:,.2f}` (ล็อกหน้าไม้)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏰ *Time:* `{latest_time_str}`\n"
+                f"💡 _ยกระดับด้วย SMC + ML Filter + DevOps Protection_"
             )
 
             print(alert_msg)
             send_telegram_alert(alert_msg)
-            save_last_signal(latest_time_str, signal_type)  # บันทึกกันส่งซ้ำ
+            save_last_signal(latest_time_str, signal_type)
         else:
             print(f"⛔ สัญญาณถูกปฏิเสธเนื่องจากความมั่นใจ ML ({win_prob*100:.1f}%) ต่ำกว่าเกณฑ์")
 
@@ -240,4 +363,4 @@ def run_scanner():
 
 if __name__ == "__main__":
     run_scanner()
-                                               
+        
