@@ -1,9 +1,9 @@
 {
-    "PROBA_THRESHOLD": 0.60,
+    "PROBA_THRESHOLD": 0.55,
     "RR_RATIO": 3.0,
-    "GOLD_SL_BUFFER": 0.80,
-    "WIN_RATE": 65.5,
-    "TOTAL_TRADES": 28,
-    "TOTAL_R_RETURN": 18.5,
-    "UPDATED_AT": "2026-08-04 19:26:00"
+    "GOLD_SL_BUFFER": 0.5,
+    "WIN_RATE": 100.0,
+    "TOTAL_TRADES": 8,
+    "TOTAL_R_RETURN": 24.0,
+    "UPDATED_AT": "2026-08-04 12:48:16"
 }
