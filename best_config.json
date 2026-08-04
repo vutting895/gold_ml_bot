@@ -1,0 +1,5 @@
+{
+  "PROBA_THRESHOLD": 0.55,
+  "RR_RATIO": 1.5,
+  "GOLD_SL_BUFFER": 2.5
+}
