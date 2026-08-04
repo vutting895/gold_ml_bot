@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Gold SMC Forward Test Dashboard", layout="wide")
 
@@ -13,16 +13,16 @@ st.markdown("ระบบติดตามผลการเทรดจริ�
 def load_data():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_dict = st.secrets["GOOGLE_CREDENTIALS"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     client = gspread.authorize(creds)
-    sheet = client.open("Gold_Trading_Logs").worksheet("Signals")
+    sheet = client.open("Gold_Trading_Logs").worksheet("Signals") #[span_1](start_span)[span_1](end_span)
     data = sheet.get_all_records()
     return pd.DataFrame(data)
 
 try:
     df = load_data()
 
-    if not df.empty:
+    if not df.empty and 'Status' in df.columns and 'PnL' in df.columns:
         # คำนวณ Metrics
         total_trades = len(df)
         closed_trades = df[df['Status'] != 'OPEN']
@@ -48,8 +48,8 @@ try:
         st.dataframe(df.sort_index(ascending=False), use_container_width=True)
 
     else:
-        st.info("ยังไม่มีข้อมูลสัญญาณในระบบ")
+        st.info("ยังไม่มีข้อมูลสัญญาณในระบบ หรือโครงสร้างคอลัมน์ยังไม่ครบถ้วน (ต้องการคอลัมน์ Status และ PnL)")
 
 except Exception as e:
     st.error(f"เกิดข้อผิดพลาดในการโหลดข้อมูล: {e}")
-  
+    
