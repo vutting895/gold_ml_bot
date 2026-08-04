@@ -1,5 +1,12 @@
+"""
+Gold Real-time Scanner (gold_realtime_scanner.py)
+สคริปต์สแกนราคาทองคำ Real-time M5 SMC (Wave 3 + FVG)
+ร่วมกับการกรองสัญญาณด้วย ML Model และคำนวณ Lot Size อัตโนมัติ
+"""
+
 import os
 import math
+import json
 import requests
 import joblib
 import pandas as pd
@@ -7,26 +14,47 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime
 
-# ==================== 1. CONFIGURATION & TUNING ====================
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+# ==================== 1. CONFIGURATION & AUTO-TUNING ====================
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE"))
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
 MODEL_FILE_PATH  = os.getenv("MODEL_FILE_PATH", "gold_ml_filter.pkl")
+CONFIG_FILE_PATH = os.getenv("CONFIG_FILE_PATH", "best_config.json")
 
-# --- PARAMETER TUNING ---
-# 1. ปรับค่าความมั่นใจขั้นต่ำของโมเดล ( default: 0.60 หรือ 60% )
-PROBABILITY_THRESHOLD = float(os.getenv("PROBABILITY_THRESHOLD", "0.60"))
+SYMBOL              = "GC=F"                                        # Gold Futures / Spot Gold (XAUUSD)
+ACCOUNT_EQUITY      = float(os.getenv("ACCOUNT_EQUITY", "10000.0")) # ขนาดพอร์ต ($)
+BASE_RISK_PCT       = float(os.getenv("RISK_PCT", "0.01"))          # ความเสี่ยงพื้นฐาน 1% (0.01)
+DYNAMIC_LOT_SCALING = True                                         # เปิดใช้การปรับ Lot ตามความมั่นใจโมเดล
 
-# 2. ตั้งค่าพอร์ตและการคำนวณ Lot Size
-ACCOUNT_EQUITY = float(os.getenv("ACCOUNT_EQUITY", "10000.0")) # ขนาดพอร์ต ($)
-BASE_RISK_PCT  = float(os.getenv("RISK_PCT", "0.01"))          # ความเสี่ยงพื้นฐาน 1% (0.01)
-DYNAMIC_LOT_SCALING = True                                     # เปิดใช้การปรับ Lot ตามความมั่นใจโมเดล
-
-SYMBOL         = "GC=F"       # Gold Futures / Spot Gold (XAUUSD)
-RR_RATIO       = 3.0          # Risk-to-Reward Ratio (1:3.0)
-GOLD_SL_BUFFER = 0.80         # SL Buffer เผื่อไส้เทียน ($0.80)
+def load_auto_config():
+    """ โหลดพารามิเตอร์ที่ผ่านการ Auto-Optimization จาก best_config.json """
+    default_config = {
+        "PROBA_THRESHOLD": 0.60,
+        "RR_RATIO": 3.0,
+        "GOLD_SL_BUFFER": 0.80
+    }
+    
+    if os.path.exists(CONFIG_FILE_PATH):
+        try:
+            with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                print(f"⚙️ Loaded Config from '{CONFIG_FILE_PATH}':")
+                print(f"   • Proba Threshold : {config.get('PROBA_THRESHOLD', default_config['PROBA_THRESHOLD'])}")
+                print(f"   • RR Ratio        : 1:{config.get('RR_RATIO', default_config['RR_RATIO'])}")
+                print(f"   • SL Buffer       : ${config.get('GOLD_SL_BUFFER', default_config['GOLD_SL_BUFFER'])}")
+                return config
+        except Exception as e:
+            print(f"⚠️ อ่านไฟล์คอนฟิกไม่สำเร็จ ({e}) -> ใช้งานค่า Default")
+            return default_config
+    else:
+        print(f"⚠️ ไม่พบไฟล์ {CONFIG_FILE_PATH} -> ใช้งานค่า Default")
+        return default_config
 
 def send_telegram_alert(message: str):
     """ ส่งข้อความการแจ้งเตือนเข้า Telegram """
+    if TELEGRAM_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_TELEGRAM_CHAT_ID_HERE":
+        print("ℹ️ ไม่ได้ระบุ TELEGRAM_TOKEN หรือ TELEGRAM_CHAT_ID (แสดงผลเฉพาะบน Console)")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -35,32 +63,38 @@ def send_telegram_alert(message: str):
     }
     try:
         response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"⚠️ Telegram Error: {response.text}")
+        res_data = response.json()
+        if res_data.get("ok"):
+            print("🔔 ส่งการแจ้งเตือนไปยัง Telegram เรียบร้อยแล้ว")
+        else:
+            print(f"❌ ส่ง Telegram ไม่สำเร็จ: {res_data.get('description')}")
     except Exception as e:
         print(f"❌ ไม่สามารถเชื่อมต่อ Telegram ได้: {e}")
 
 def calculate_lot_size(equity: float, risk_dist: float, win_prob: float) -> tuple[float, float]:
     """ คำนวณ Lot Size โดยอิงจากระยะ SL และความมั่นใจของโมเดล """
-    # กำหนดเปอร์เซ็นต์ความเสี่ยงตามความมั่นใจ
     if DYNAMIC_LOT_SCALING and win_prob >= 0.65:
         applied_risk_pct = BASE_RISK_PCT * 1.5  # มั่นใจสูง (>=65%): เพิ่มความเสี่ยงเป็น 1.5%
     else:
         applied_risk_pct = BASE_RISK_PCT        # มั่นใจปกติ: ใช้ความเสี่ยงพื้นฐาน 1.0%
 
     risk_amount = equity * applied_risk_pct
-    # ทองคำ 1 Lot: 1 ดอลลาร์ = $100
     calculated_lot = risk_amount / (risk_dist * 100.0)
     
-    # ปัดเศษลงตำแหน่งทศนิยม 2 ตำแหน่ง และกำหนด Lot ขั้นต่ำ 0.01
     final_lot = math.floor(calculated_lot * 100.0) / 100.0
     final_lot = max(0.01, final_lot)
     
     return final_lot, applied_risk_pct * 100.0
 
 def scan_gold_market():
+    # โหลด Config อัตโนมัติจาก best_config.json
+    config = load_auto_config()
+    proba_threshold = float(config.get("PROBA_THRESHOLD", 0.60))
+    rr_ratio        = float(config.get("RR_RATIO", 3.0))
+    sl_buffer       = float(config.get("GOLD_SL_BUFFER", 0.80))
+
     current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"🔍 [{current_time_str}] สแกนกราฟ M5 (Threshold: {PROBABILITY_THRESHOLD*100:.0f}%)...")
+    print(f"\n🔍 [{current_time_str}] สแกนกราฟ M5 (Threshold: {proba_threshold*100:.0f}%)...")
 
     if not os.path.exists(MODEL_FILE_PATH):
         print(f"❌ ไม่พบไฟล์โมเดลที่ Path: {MODEL_FILE_PATH}")
@@ -79,9 +113,10 @@ def scan_gold_market():
 
         df_5m = df_5m.dropna()
         if len(df_5m) < 50:
+            print("❌ ข้อมูลไม่เพียงพอสำหรับประมวลผล")
             return
 
-        # Multi-timeframe Resampling
+        # Multi-timeframe Resampling (H1 และ M15)
         df_15m = df_5m.resample('15min').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
         df_1h  = df_5m.resample('1H').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
 
@@ -95,7 +130,7 @@ def scan_gold_market():
         df_5m['H1_Trend'] = df_1h['H1_Trend'].reindex(df_5m.index, method='ffill')
         df_5m['M15_Trend'] = df_15m['M15_Trend'].reindex(df_5m.index, method='ffill')
 
-        # ATR & FVG
+        # ATR & Fair Value Gap (FVG)
         high_low = df_5m['High'] - df_5m['Low']
         high_cp  = np.abs(df_5m['High'] - df_5m['Close'].shift(1))
         low_cp   = np.abs(df_5m['Low'] - df_5m['Close'].shift(1))
@@ -117,19 +152,20 @@ def scan_gold_market():
 
         entry_price = float(latest_bar['Close'])
         if is_long:
-            sl_price    = float(min(latest_bar['Low'], prev_bar['Low'])) - GOLD_SL_BUFFER
+            sl_price    = float(min(latest_bar['Low'], prev_bar['Low'])) - sl_buffer
             risk_dist   = entry_price - sl_price
-            tp_price    = entry_price + (risk_dist * RR_RATIO)
+            tp_price    = entry_price + (risk_dist * rr_ratio)
             fvg_size    = float(latest_bar['Low'] - df_5m.iloc[-4]['High'])
             signal_type = "BUY 🟢"
         else:
-            sl_price    = float(max(latest_bar['High'], prev_bar['High'])) + GOLD_SL_BUFFER
+            sl_price    = float(max(latest_bar['High'], prev_bar['High'])) + sl_buffer
             risk_dist   = sl_price - entry_price
-            tp_price    = entry_price - (risk_dist * RR_RATIO)
+            tp_price    = entry_price - (risk_dist * rr_ratio)
             fvg_size    = float(df_5m.iloc[-4]['Low'] - latest_bar['High'])
             signal_type = "SELL 🔴"
 
         if risk_dist <= 0:
+            print("⚠️ ระยะ Risk Distance ไม่ถูกต้อง (<= 0) ข้ามการประมวลผล")
             return
 
         features = pd.DataFrame([{
@@ -144,25 +180,30 @@ def scan_gold_market():
         print(f"💡 พบ Setup {signal_type} | ML Win Prob: {win_prob*100:.1f}%")
 
         # กรองเฉพาะสัญญาณที่ผ่าน Threshold
-        if win_prob >= PROBABILITY_THRESHOLD:
+        if win_prob >= proba_threshold:
             lot_size, risk_pct_used = calculate_lot_size(ACCOUNT_EQUITY, risk_dist, win_prob)
 
-            alert_msg = f"""🚨 *SIGNAL ALERT: XAU/USD ({signal_type})*
-━━━━━━━━━━━━━━━━━━━━
-🤖 *ML Win Probability:* `{win_prob*100:.1f}%` (Threshold ≥ {PROBABILITY_THRESHOLD*100:.0f}%)
-📍 *Entry Price:* `${entry_price:,.2f}`
-🛑 *Stop Loss (SL):* `${sl_price:,.2f}` (`${risk_dist:.2f}` Risk)
-🎯 *Take Profit (TP):* `${tp_price:,.2f}` (R:R 1:{RR_RATIO})
-⚖️ *Recommended Lot:* `{lot_size}` Lot (Risk {risk_pct_used:.1f}%)
-⏰ *Time:* `{latest_time.strftime('%Y-%m-%d %H:%M')}`
-━━━━━━━━━━━━━━━━━━━━
-💡 _ยกระดับด้วย H1-M15-M5 SMC + Dynamic ML Risk_"""
+            alert_msg = (
+                f"🚨 *SIGNAL ALERT: XAU/USD ({signal_type})*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 *ML Win Probability:* `{win_prob*100:.1f}%` (Threshold ≥ {proba_threshold*100:.0f}%)\n"
+                f"📍 *Entry Price:* `${entry_price:,.2f}`\n"
+                f"🛑 *Stop Loss (SL):* `${sl_price:,.2f}` (`${risk_dist:.2f}` Risk)\n"
+                f"🎯 *Take Profit (TP):* `${tp_price:,.2f}` (R:R 1:{rr_ratio})\n"
+                f"⚖️ *Recommended Lot:* `{lot_size}` Lot (Risk {risk_pct_used:.1f}%)\n"
+                f"⏰ *Time:* `{latest_time.strftime('%Y-%m-%d %H:%M')}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 _ยกระดับด้วย H1-M15-M5 SMC + Dynamic ML Risk_"
+            )
 
+            print(alert_msg)
             send_telegram_alert(alert_msg)
+        else:
+            print(f"⛔ สัญญาณถูกปฏิเสธเนื่องจากความมั่นใจของ ML ({win_prob*100:.1f}%) ต่ำกว่าเกณฑ์ที่ตั้งไว้ ({proba_threshold*100:.1f}%)")
 
     except Exception as e:
         print(f"⚠️ เกิดข้อผิดพลาดขณะสแกนตลาด: {e}")
 
 if __name__ == "__main__":
     scan_gold_market()
-    
+            
