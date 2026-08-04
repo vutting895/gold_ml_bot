@@ -1,7 +1,7 @@
 """
 Gold ML Model Trainer (train_gold_model.py)
-ระบบดึงข้อมูลอดีต สร้าง Features ประมวลผล SMC Signal
-และเทรนโมเดล RandomForestClassifier เพื่อเซฟเป็น gold_ml_filter.pkl
+อัปเกรด Advanced Feature Engineering (RSI, DayOfWeek)
+และใช้ class_weight='balanced' ใน RandomForestClassifier
 """
 
 import os
@@ -13,15 +13,20 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 
-# ==================== CONFIGURATION ====================
-SYMBOL = "GC=F"                      # Spot Gold บน Yahoo Finance
+SYMBOL = "GC=F"
 MODEL_OUTPUT_PATH = "gold_ml_filter.pkl"
-LOOKBACK_PERIOD = "60d"             # ดึงข้อมูลย้อนหลัง 60 วัน (ขีดจำกัด M5 บน yfinance)
-RR_RATIO = 3.0                      # Risk-to-Reward Ratio สำหรับกำหนด Label (Win/Loss)
-SL_BUFFER = 0.80                    # SL Buffer เผื่อไส้เทียน ($0.80)
+LOOKBACK_PERIOD = "60d"
+RR_RATIO = 3.0
+SL_BUFFER = 0.80
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
 def fetch_and_prepare_data():
-    """ดึงข้อมูลราคา M5 ย้อนหลังและคำนวณ Multi-Timeframe Trend + Indicators"""
     print(f"📥 กำลังดึงข้อมูลราคาทองคำ ({SYMBOL}) ย้อนหลัง {LOOKBACK_PERIOD}...")
     df_5m = yf.download(SYMBOL, period=LOOKBACK_PERIOD, interval="5m", progress=False)
 
@@ -30,44 +35,35 @@ def fetch_and_prepare_data():
 
     df_5m = df_5m.dropna()
     if len(df_5m) < 200:
-        print("❌ ข้อมูลไม่เพียงพอสำหรับการเทรนโมเดล")
         return None
 
-    print(f"📊 โหลดข้อมูลเรียบร้อยแล้ว ทั้งหมด {len(df_5m)} แท่ง")
-
-    # 1. Multi-timeframe Resampling (H1 และ M15)
+    # Resampling
     df_15m = df_5m.resample('15min').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
     df_1h  = df_5m.resample('1H').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
 
-    # 2. คำนวณ Trend Indicators
     df_1h['EMA_50'] = df_1h['Close'].ewm(span=50, adjust=False).mean()
     df_1h['H1_Trend'] = np.where(df_1h['Close'] > df_1h['EMA_50'], 1, -1)
 
     df_15m['EMA_20'] = df_15m['Close'].ewm(span=20, adjust=False).mean()
     df_15m['M15_Trend'] = np.where(df_15m['Close'] > df_15m['EMA_20'], 1, -1)
 
-    # แมปค่า Trend กลับมาที่ M5
     df_5m['H1_Trend'] = df_1h['H1_Trend'].reindex(df_5m.index, method='ffill')
     df_5m['M15_Trend'] = df_15m['M15_Trend'].reindex(df_5m.index, method='ffill')
 
-    # 3. คำนวณ ATR 14
+    # Priority 3 Features: ATR & RSI
     high_low = df_5m['High'] - df_5m['Low']
     high_cp  = np.abs(df_5m['High'] - df_5m['Close'].shift(1))
     low_cp   = np.abs(df_5m['Low'] - df_5m['Close'].shift(1))
     df_5m['ATR'] = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1).rolling(14).mean()
+    df_5m['RSI'] = calculate_rsi(df_5m['Close'], 14)
 
-    # 4. คำนวณ Fair Value Gap (FVG)
     df_5m['Bullish_FVG'] = df_5m['Low'] > df_5m['High'].shift(2)
     df_5m['Bearish_FVG'] = df_5m['High'] < df_5m['Low'].shift(2)
 
     return df_5m.dropna()
 
 def create_dataset(df):
-    """ระบุ Setup SMC ในอดีต และสร้าง Target Label (Win=1 / Loss=0)"""
-    print("⚙️ กำลังประมวลผลค้นหา Setup SMC และสร้าง Dataset...")
     samples = []
-
-    # วนลูปตรวจจับสัญญาณในอดีต (เว้นระยะท้ายไว้สำหรับ Label Verification)
     for i in range(50, len(df) - 100):
         latest_bar  = df.iloc[i]
         prev_bar    = df.iloc[i-1]
@@ -96,9 +92,8 @@ def create_dataset(df):
         if risk_dist <= 0:
             continue
 
-        # ตรวจสอบอนาคต (Forward Simulation) ว่าชน TP หรือ SL ก่อนกัน
         future_bars = df.iloc[i+1 : i+101]
-        label = 0  # 0 = Loss, 1 = Win
+        label = 0
 
         for _, f_bar in future_bars.iterrows():
             if is_long:
@@ -116,65 +111,52 @@ def create_dataset(df):
                     label = 0
                     break
 
-        # เก็บ Feature ตรงกับที่ scanner.py เรียกใช้งาน
         samples.append({
             'FVG_Size': fvg_size,
             'ATR': float(latest_bar['ATR']),
+            'RSI': float(latest_bar['RSI']),
             'Hour': int(latest_time.hour),
-            'Minute': int(latest_time.minute),
+            'DayOfWeek': int(latest_time.dayofweek),
             'Risk_Distance': risk_dist,
             'Target': label
         })
 
-    dataset = pd.DataFrame(samples)
-    print(f"✅ พบข้อมูลการเทรน SMC ย้อนหลังทั้งหมด {len(dataset)} ตัวอย่าง")
-    if len(dataset) > 0:
-        win_rate = (dataset['Target'].sum() / len(dataset)) * 100
-        print(f"📈 Raw Signal Win Rate (ก่อน ML Filter): {win_rate:.2f}%")
-    return dataset
+    return pd.DataFrame(samples)
 
 def train_and_save_model():
-    """เทรนโมเดล RandomForestClassifier และบันทึกไฟล์ .pkl"""
     df = fetch_and_prepare_data()
     if df is None:
         return
 
     dataset = create_dataset(df)
     if dataset.empty or len(dataset) < 30:
-        print("❌ ตัวอย่างข้อมูลมีจำนวนน้อยเกินไปสำหรับทำการเทรน")
+        print("❌ ตัวอย่างข้อมูลมีจำนวนน้อยเกินไปสำหรับการเทรน")
         return
 
-    # แบ่ง Features (X) และ Target (y)
-    feature_cols = ['FVG_Size', 'ATR', 'Hour', 'Minute', 'Risk_Distance']
+    feature_cols = ['FVG_Size', 'ATR', 'RSI', 'Hour', 'DayOfWeek', 'Risk_Distance']
     X = dataset[feature_cols]
     y = dataset['Target']
 
-    # แบ่ง Train / Test Set (80% Train, 20% Test)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # สร้างและเทรนโมเดล
-    print("\n🧠 กำลังเทรนโมเดล Machine Learning (Random Forest)...")
+    print("\n🧠 กำลังเทรนโมเดล Machine Learning (Random Forest Balanced)...")
     model = RandomForestClassifier(
         n_estimators=100,
         max_depth=5,
         min_samples_split=5,
+        class_weight='balanced',  # แก้ไข Class Imbalance
         random_state=42
     )
     model.fit(X_train, y_train)
 
-    # วัดผลการทดสอบ
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
 
-    print("\n" + "="*50)
-    print(f"🎯 Model Accuracy บน Test Set: {acc*100:.2f}%")
-    print("="*50)
-    print("\n📋 Classification Report:")
+    print(f"\n🎯 Model Accuracy บน Test Set: {acc*100:.2f}%")
     print(classification_report(y_test, y_pred, zero_division=0))
 
-    # เซฟโมเดล
     joblib.dump(model, MODEL_OUTPUT_PATH)
     print(f"💾 บันทึกโมเดลสำเร็จเรียบร้อยที่ไฟล์: '{MODEL_OUTPUT_PATH}'")
 
