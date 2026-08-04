@@ -2,54 +2,44 @@ name: Retrain Model & Auto-Optimize Config
 
 on:
   schedule:
-    - cron: '0 0 * * 0'   # ⏰ รันทุกวันอาทิตย์ เวลา 00:00 UTC (ช่วงตลาดปิด)
-  workflow_dispatch:      # 🔘 ปุ่มกดสั่งรันด้วยมือบนหน้าเว็บ GitHub
-
-permissions:
-  contents: write         # ให้สิทธิ์ Push ไฟล์ gold_ml_filter.pkl และ best_config.json กลับเข้า Repository
+    # รันทุกวันอาทิตย์ เวลา 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
 
 jobs:
-  retrain_and_optimize:
-    name: Retrain ML & Optimize Config
+  retrain:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true  # ใช้ Token ที่มีสิทธิ์ Push ข้อมูลกลับ
+        uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.10'
-          cache: 'pip'               # แคช Dependency เพื่อให้รันไวขึ้นในรอบถัดไป
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      - name: 1. Run ML Model Training
-        run: |
-          python train_gold_model.py
+      - name: Run Model Retraining
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: python train_gold_model.py
 
-      - name: 2. Run Auto Backtest Optimization
-        run: |
-          python auto_backtest_optimizer.py
+      - name: Run Auto Backtest Optimizer
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: python auto_backtest_optimizer.py
 
-      - name: 3. Commit & Push Updated Model and Config
+      - name: Commit and Push Updated Model
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # ดึงข้อมูลล่าสุดจาก Remote ก่อนเพื่อป้องกันปัญหา Git Conflict
-          git pull origin main --rebase || true
-          
-          # ตรวจสอบการเปลี่ยนแปลงไฟล์ก่อนทำการ Add และ Commit
-          if [ -f gold_ml_filter.pkl ] || [ -f best_config.json ]; then
-            git add gold_ml_filter.pkl best_config.json
-            git commit -m "🤖 Auto-retrained ML model & updated best_config.json [skip ci]" || echo "ไม่มีการเปลี่ยนแปลงไฟล์"
-            git push origin main || echo "ไม่มีไฟล์ใหม่ให้ Push"
-          fi
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add gold_ml_filter.pkl config.json || true
+          git commit -m "🤖 Auto-retrained ML Model & Optimized Config [skip ci]" || exit 0
+          git push
           
