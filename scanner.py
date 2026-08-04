@@ -18,7 +18,7 @@ MODEL_FILE = "gold_ml_filter.pkl"
 
 
 def fetch_twelvedata_m5_data(count=100):
-  """ดึงข้อมูลราคาย้อนหลัง M5 สำหรับ XAU/USD จาก Twelve Data API"""
+  """ดึงข้อมูลราคาย้อนหลัง M5 สำหรับ XAU/USD จาก Twelve Data API (ปรับเวลาเป็นโซนเวลาไทย Asia/Bangkok UTC+7)"""
   api_key = TWELVE_DATA_API_KEY
   symbol = "XAU/USD"
   interval = "5min"
@@ -29,6 +29,7 @@ def fetch_twelvedata_m5_data(count=100):
       "outputsize": count,
       "apikey": api_key,
       "format": "JSON",
+      "timezone": "Asia/Bangkok",  # กำหนดโซนเวลาประเทศไทย (UTC+7) โดยตรงจาก API
   }
   try:
     response = requests.get(url, params=params)
@@ -41,8 +42,9 @@ def fetch_twelvedata_m5_data(count=100):
     values = data["values"]
     parsed_data = []
     for c in reversed(values):
+      dt = pd.to_datetime(c["datetime"])
       parsed_data.append({
-          "time": pd.to_datetime(c["datetime"]),
+          "time": dt,
           "open": float(c["open"]),
           "high": float(c["high"]),
           "low": float(c["low"]),
@@ -99,7 +101,15 @@ def get_google_sheet_handle():
     # ตรวจสอบว่ามี Header หรือยัง
     existing_data = sheet.get_all_values()
     if not existing_data:
-      headers = ["Time", "Type", "Entry", "SL", "TP", "Status", "PnL"]
+      headers = [
+          "Time (UTC+7)",
+          "Type",
+          "Entry",
+          "SL",
+          "TP",
+          "Status",
+          "PnL",
+      ]
       sheet.append_row(headers)
 
     return sheet
@@ -134,12 +144,15 @@ def detect_smc_fvg(df):
   c2 = df.iloc[i - 1]
   c3 = df.iloc[i]
 
+  # ฟอร์แมตเวลาให้เป็น String อ่านง่าย ชัดเจน (YYYY-MM-DD HH:MM:SS)
+  time_str = df.index[i].strftime("%Y-%m-%d %H:%M:%S")
+
   # Bullish FVG
   if c3["low"] > c1["high"]:
     fvg_size = c3["low"] - c1["high"]
     return {
         "type": "BUY",
-        "time": str(df.index[i]),
+        "time": time_str,
         "entry": c3["close"],
         "fvg_size": fvg_size,
         "sl": c1["low"] - 1.5,
@@ -150,7 +163,7 @@ def detect_smc_fvg(df):
     fvg_size = c1["low"] - c3["high"]
     return {
         "type": "SELL",
-        "time": str(df.index[i]),
+        "time": time_str,
         "entry": c3["close"],
         "fvg_size": fvg_size,
         "sl": c1["high"] + 1.5,
@@ -160,7 +173,7 @@ def detect_smc_fvg(df):
 
 
 def main():
-  print("กำลังรันระบบ Gold SMC Scanner บน GitHub Actions...")
+  print("กำลังรันระบบ Gold SMC Scanner บน GitHub Actions (โซนเวลาไทย UTC+7)...")
 
   # 1. เชื่อมต่อ Google Sheets
   sheet = get_google_sheet_handle()
@@ -180,7 +193,9 @@ def main():
   # 4. ตรวจสอบสัญญาณซ้ำจาก Google Sheets
   last_time_in_sheet = get_last_signal_time(sheet)
   if last_time_in_sheet == signal["time"]:
-    print(f"สัญญาณเวลา {signal['time']} ถูกแจ้งเตือนไปแล้ว ข้ามการทำงาน")
+    print(
+        f"สัญญาณเวลา {signal['time']} (UTC+7) ถูกแจ้งเตือนไปแล้ว ข้ามการทำงาน"
+    )
     return
 
   # 5. กรองด้วย Machine Learning (ถ้ามีไฟล์โมเดล)
@@ -194,7 +209,7 @@ def main():
       gain = (delta.where(delta > 0, 0)).rolling(14).mean()
       loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
       rs = gain / loss
-      rsi = 100 - (100 / (1 + rs)).iloc[-1]
+      rsi = (100 - (100 / (1 + rs))).iloc[-1]
 
       t = pd.to_datetime(signal["time"])
       hour = t.hour
@@ -216,7 +231,7 @@ def main():
     msg = (
         f"🚨 *Gold SMC Signal Detected!*\n"
         f"Type: *{signal['type']}*\n"
-        f"Time: `{signal['time']}`\n"
+        f"Time (TH): `{signal['time']}` (UTC+7)\n"
         f"Entry: `{signal['entry']:.2f}`\n"
         f"SL: `{signal['sl']:.2f}`\n"
         f"FVG Size: `{signal['fvg_size']:.2f}`"
@@ -242,7 +257,7 @@ def main():
       sheet.append_row(row_data)
       print("บันทึกข้อมูลลง Google Sheets เรียบร้อยแล้ว")
 
-    print("ส่งสัญญาณเรียบร้อยแล้ว")
+    print(f"ส่งสัญญาณเวลา {signal['time']} (UTC+7) เรียบร้อยแล้ว")
 
 
 if __name__ == "__main__":
