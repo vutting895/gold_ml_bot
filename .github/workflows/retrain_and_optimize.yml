@@ -6,7 +6,7 @@ on:
   workflow_dispatch:      # 🔘 ปุ่มกดสั่งรันด้วยมือบนหน้าเว็บ GitHub
 
 permissions:
-  contents: write         # สิทธิ์ในการ Push ไฟล์ gold_ml_filter.pkl และ best_config.json กลับเข้า Repository
+  contents: write         # ให้สิทธิ์ Push ไฟล์ gold_ml_filter.pkl และ best_config.json กลับเข้า Repository
 
 jobs:
   retrain_and_optimize:
@@ -16,17 +16,19 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true  # ใช้ Token ที่มีสิทธิ์ Push ข้อมูลกลับ
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
+          cache: 'pip'               # แคช Dependency เพื่อให้รันไวขึ้นในรอบถัดไป
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: 1. Run ML Model Training
         run: |
@@ -38,9 +40,16 @@ jobs:
 
       - name: 3. Commit & Push Updated Model and Config
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action Bot"
-          git add gold_ml_filter.pkl best_config.json
-          git commit -m "🤖 Auto-retrained ML model & updated best_config.json [skip ci]" || exit 0
-          git push
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # ดึงข้อมูลล่าสุดจาก Remote ก่อนเพื่อป้องกันปัญหา Git Conflict
+          git pull origin main --rebase || true
+          
+          # ตรวจสอบการเปลี่ยนแปลงไฟล์ก่อนทำการ Add และ Commit
+          if [ -f gold_ml_filter.pkl ] || [ -f best_config.json ]; then
+            git add gold_ml_filter.pkl best_config.json
+            git commit -m "🤖 Auto-retrained ML model & updated best_config.json [skip ci]" || echo "ไม่มีการเปลี่ยนแปลงไฟล์"
+            git push origin main || echo "ไม่มีไฟล์ใหม่ให้ Push"
+          fi
           
