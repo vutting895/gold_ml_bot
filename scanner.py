@@ -20,7 +20,31 @@ MODEL_FILE = "gold_ml_filter.pkl"
 
 
 # ==========================================
-# 1. TELEGRAM NOTIFICATION SYSTEM (HTML)
+# 1. TECHNICAL INDICATORS (CONSISTENT ENGINE)
+# ==========================================
+def add_indicators(df):
+  """คำนวณ ATR และ RSI ตามมาตรฐานสากลเพื่อความแม่นยำของ ML และ Dynamic SL"""
+  df = df.copy()
+
+  # 1. True Range & ATR (14)
+  high_low = df["high"] - df["low"]
+  high_close = (df["high"] - df["close"].shift()).abs()
+  low_close = (df["low"] - df["close"].shift()).abs()
+  tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+  df["atr"] = tr.rolling(14).mean()
+
+  # 2. RSI (14)
+  delta = df["close"].diff()
+  gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+  loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+  rs = gain / loss
+  df["rsi"] = 100 - (100 / (1 + rs))
+
+  return df
+
+
+# ==========================================
+# 2. TELEGRAM NOTIFICATION SYSTEM (HTML)
 # ==========================================
 def send_telegram_message(message: str) -> bool:
   """ฟังก์ชันส่งข้อความไปยัง Telegram Bot ผ่าน HTTP POST (ใช้ HTML Format)"""
@@ -87,14 +111,14 @@ def send_signal_alert(
 
   message += (
       "━━━━━━━━━━━━━━━━━━\n"
-      "🤖 <i>Validated by ML Filter & Automated System</i>\n"
+      "🤖 <i>Validated by Dynamic SL & ML Filter System</i>\n"
   )
 
   return send_telegram_message(message)
 
 
 # ==========================================
-# 2. DATA FETCHING & GOOGLE SHEETS SYSTEM
+# 3. DATA FETCHING & GOOGLE SHEETS SYSTEM
 # ==========================================
 def fetch_twelvedata_m5_data(count=100):
   """ดึงข้อมูลราคาย้อนหลัง M5 สำหรับ XAU/USD จาก Twelve Data API (โซนเวลาไทย Asia/Bangkok UTC+7)"""
@@ -129,6 +153,7 @@ def fetch_twelvedata_m5_data(count=100):
     df = pd.DataFrame(parsed_data)
     if not df.empty:
       df.set_index("time", inplace=True)
+      df = add_indicators(df)
     return df
   except Exception as e:
     print(f"เกิดข้อผิดพลาดในการดึงข้อมูลราคา: {e}")
@@ -201,12 +226,10 @@ def update_open_trades_status(sheet, df_prices):
         tp = float(row["TP"])
         trade_type = str(row["Type"]).upper()
 
-        # แปลงเวลาของสัญญาณเป็น timezone-aware (Asia/Bangkok)
         signal_time = pd.to_datetime(row["Time (UTC+7)"])
         if signal_time.tzinfo is None:
           signal_time = tz_th.localize(signal_time)
 
-        # กรองแท่งเทียนที่เกิดหลังจากสัญญาณ
         df_index_tz = (
             df_prices.index.tz_localize(tz_th)
             if df_prices.index.tzinfo is None
@@ -218,9 +241,8 @@ def update_open_trades_status(sheet, df_prices):
           high = candle["high"]
           low = candle["low"]
 
-          # กรณี BUY Order
           if trade_type == "BUY":
-            if low <= sl:  # ชน Stop Loss
+            if low <= sl:  # ชน SL
               pnl = round(sl - entry, 2)
               sheet.update_cell(idx, 6, "LOSS")
               sheet.update_cell(idx, 7, pnl)
@@ -229,7 +251,7 @@ def update_open_trades_status(sheet, df_prices):
                   f" ${pnl})"
               )
               break
-            elif high >= tp:  # ชน Take Profit
+            elif high >= tp:  # ชน TP
               pnl = round(tp - entry, 2)
               sheet.update_cell(idx, 6, "WIN")
               sheet.update_cell(idx, 7, pnl)
@@ -239,9 +261,8 @@ def update_open_trades_status(sheet, df_prices):
               )
               break
 
-          # กรณี SELL Order
           elif trade_type == "SELL":
-            if high >= sl:  # ชน Stop Loss
+            if high >= sl:  # ชน SL
               pnl = round(entry - sl, 2)
               sheet.update_cell(idx, 6, "LOSS")
               sheet.update_cell(idx, 7, pnl)
@@ -250,7 +271,7 @@ def update_open_trades_status(sheet, df_prices):
                   f" ${pnl})"
               )
               break
-            elif low <= tp:  # ชน Take Profit
+            elif low <= tp:  # ชน TP
               pnl = round(entry - tp, 2)
               sheet.update_cell(idx, 6, "WIN")
               sheet.update_cell(idx, 7, pnl)
@@ -265,10 +286,10 @@ def update_open_trades_status(sheet, df_prices):
 
 
 # ==========================================
-# 3. SMC DETECTOR & MAIN SCANNER LOGIC
+# 4. SMC DETECTOR & MAIN SCANNER LOGIC
 # ==========================================
 def detect_smc_fvg(df):
-  """ตรวจสอบโครงสร้าง Fair Value Gap (FVG) แบบ SMC"""
+  """ตรวจสอบโครงสร้าง Fair Value Gap (FVG) แบบ SMC + Dynamic SL ตามค่า ATR"""
   if len(df) < 3:
     return None
 
@@ -282,6 +303,14 @@ def detect_smc_fvg(df):
 
   time_str = df.index[i].strftime("%Y-%m-%d %H:%M:%S")
 
+  # คำนวณ Dynamic Buffer จาก ATR (ใช้ 0.5 * ATR หรือขั้นต่ำ 1.0$)
+  latest_atr = (
+      df["atr"].iloc[i]
+      if "atr" in df.columns and not pd.isna(df["atr"].iloc[i])
+      else 1.5
+  )
+  sl_buffer = max(0.5 * latest_atr, 1.0)
+
   # Bullish FVG
   if c3["low"] > c1["high"]:
     fvg_size = c3["low"] - c1["high"]
@@ -290,7 +319,9 @@ def detect_smc_fvg(df):
         "time": time_str,
         "entry": c3["close"],
         "fvg_size": fvg_size,
-        "sl": c1["low"] - 1.5,
+        "sl": c1["low"] - sl_buffer,
+        "atr": latest_atr,
+        "rsi": df["rsi"].iloc[i] if "rsi" in df.columns else 50.0,
     }
 
   # Bearish FVG
@@ -301,7 +332,9 @@ def detect_smc_fvg(df):
         "time": time_str,
         "entry": c3["close"],
         "fvg_size": fvg_size,
-        "sl": c1["high"] + 1.5,
+        "sl": c1["high"] + sl_buffer,
+        "atr": latest_atr,
+        "rsi": df["rsi"].iloc[i] if "rsi" in df.columns else 50.0,
     }
 
   return None
@@ -324,7 +357,7 @@ def main():
     print("ไม่สามารถดึงข้อมูลราคาได้")
     return
 
-  # 2. ตรวจสอบออเดอร์เก่าสถานะ OPEN ใน Google Sheets
+  # 2. ตรวจสอบและอัปเดตสถานะออเดอร์ค้างเก่า (WIN/LOSS)
   if sheet:
     update_open_trades_status(sheet, df)
 
@@ -346,13 +379,8 @@ def main():
   if os.path.exists(MODEL_FILE):
     try:
       model = joblib.load(MODEL_FILE)
-      close_prices = df["close"]
-      atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-      delta = close_prices.diff()
-      gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-      loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-      rs = gain / loss
-      rsi = (100 - (100 / (1 + rs))).iloc[-1]
+      atr = signal.get("atr", 1.5)
+      rsi = signal.get("rsi", 50.0)
 
       t = pd.to_datetime(signal["time"])
       hour = t.hour
@@ -409,4 +437,4 @@ def main():
 
 if __name__ == "__main__":
   main()
-              
+    
