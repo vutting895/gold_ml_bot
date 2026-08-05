@@ -2,13 +2,15 @@ name: Gold Real-time M5 Scanner
 
 on:
   schedule:
-    # รันทุกๆ 5 นาที (นาทีที่หารด้วย 5 ลงตัว)
+    # รันอัตโนมัติทุกๆ 5 นาที (นาทีที่หารด้วย 5 ลงตัว)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # ปุ่มกดรันเองผ่านหน้าเว็บ GitHub
+  workflow_dispatch: # ปุ่มกดสั่งรันด้วยตนเองผ่านหน้าเว็บ GitHub Actions
 
 jobs:
   scan:
+    name: Scan Gold SMC Signals
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -21,7 +23,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Gold Scanner
         env:
@@ -31,3 +33,4 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
         run: python scanner.py
+        
