@@ -1,10 +1,12 @@
 import json
 import os
+from datetime import datetime
 import joblib
 import gspread
 from google.oauth2.service_account import Credentials
 import numpy as np
 import pandas as pd
+import pytz
 import requests
 
 # โหลดค่าตัวแปรสภาพแวดล้อม (Environment Variables)
@@ -17,31 +19,104 @@ GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Gold_Trading_Logs")
 MODEL_FILE = "gold_ml_filter.pkl"
 
 
+# ==========================================
+# 1. TELEGRAM NOTIFICATION SYSTEM (HTML)
+# ==========================================
+def send_telegram_message(message: str) -> bool:
+  """ฟังก์ชันส่งข้อความไปยัง Telegram Bot ผ่าน HTTP POST (ใช้ HTML Format)"""
+  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print(
+        "❌ [Telegram Error] ไม่พบ TELEGRAM_BOT_TOKEN หรือ TELEGRAM_CHAT_ID"
+    )
+    return False
+
+  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+  payload = {
+      "chat_id": TELEGRAM_CHAT_ID,
+      "text": message,
+      "parse_mode": "HTML",
+      "disable_web_page_preview": True,
+  }
+
+  try:
+    response = requests.post(url, json=payload, timeout=10)
+    response.raise_for_status()
+    print("✅ [Telegram] ส่งข้อความแจ้งเตือนสำเร็จ")
+    return True
+  except Exception as e:
+    print(f"❌ [Telegram Error] ไม่สามารถส่งข้อความได้: {e}")
+    return False
+
+
+def send_signal_alert(
+    symbol: str,
+    signal_type: str,
+    entry: float,
+    sl: float,
+    tp: float,
+    timeframe: str = "M5",
+    fvg_size: float = None,
+) -> bool:
+  """จัดรูปแบบการ์ดสัญญาณแจ้งเตือน SMC และส่งเข้า Telegram"""
+  tz_th = pytz.timezone("Asia/Bangkok")
+  now_th = datetime.now(tz_th).strftime("%Y-%m-%d %H:%M:%S")
+
+  is_buy = signal_type.upper() == "BUY"
+  type_emoji = "🟢 BUY" if is_buy else "🔴 SELL"
+  trend_icon = "📈" if is_buy else "📉"
+
+  risk_pips = abs(entry - sl)
+  reward_pips = abs(tp - entry)
+  rr_ratio = round(reward_pips / risk_pips, 2) if risk_pips > 0 else 0.0
+
+  message = (
+      f"🚨 <b>{symbol} {timeframe} SMC SIGNAL</b> {trend_icon}\n"
+      f"━━━━━━━━━━━━━━━━━━\n"
+      f"<b>Type:</b> {type_emoji}\n"
+      f"<b>Time (TH):</b> <code>{now_th}</code> (UTC+7)\n\n"
+      f"🎯 <b>Entry Price:</b> <code>${entry:.2f}</code>\n"
+      f"🛑 <b>Stop Loss (SL):</b> <code>${sl:.2f}</code> (Risk:"
+      f" ${risk_pips:.2f})\n"
+      f"🏁 <b>Take Profit (TP):</b> <code>${tp:.2f}</code> (Reward:"
+      f" ${reward_pips:.2f})\n"
+      f"⚖️ <b>Risk : Reward:</b> <code>1:{rr_ratio}</code>\n"
+  )
+
+  if fvg_size:
+    message += f"📐 <b>FVG Gap Size:</b> <code>${fvg_size:.2f}</code>\n"
+
+  message += (
+      "━━━━━━━━━━━━━━━━━━\n"
+      "🤖 <i>Validated by ML Filter & Automated System</i>\n"
+  )
+
+  return send_telegram_message(message)
+
+
+# ==========================================
+# 2. DATA FETCHING & GOOGLE SHEETS SYSTEM
+# ==========================================
 def fetch_twelvedata_m5_data(count=100):
-  """ดึงข้อมูลราคาย้อนหลัง M5 สำหรับ XAU/USD จาก Twelve Data API (ปรับเวลาเป็นโซนเวลาไทย Asia/Bangkok UTC+7)"""
-  api_key = TWELVE_DATA_API_KEY
-  symbol = "XAU/USD"
-  interval = "5min"
+  """ดึงข้อมูลราคาย้อนหลัง M5 สำหรับ XAU/USD จาก Twelve Data API (โซนเวลาไทย Asia/Bangkok UTC+7)"""
   url = "https://api.twelvedata.com/time_series"
   params = {
-      "symbol": symbol,
-      "interval": interval,
+      "symbol": "XAU/USD",
+      "interval": "5min",
       "outputsize": count,
-      "apikey": api_key,
+      "apikey": TWELVE_DATA_API_KEY,
       "format": "JSON",
-      "timezone": "Asia/Bangkok",  # กำหนดโซนเวลาประเทศไทย (UTC+7) โดยตรงจาก API
+      "timezone": "Asia/Bangkok",
   }
   try:
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=params, timeout=10)
     response.raise_for_status()
     data = response.json()
     if "values" not in data:
       print(f"Twelve Data Error: {data.get('message', 'Unknown error')}")
       return pd.DataFrame()
 
-    values = data["values"]
     parsed_data = []
-    for c in reversed(values):
+    for c in reversed(data["values"]):
       dt = pd.to_datetime(c["datetime"])
       parsed_data.append({
           "time": dt,
@@ -49,9 +124,7 @@ def fetch_twelvedata_m5_data(count=100):
           "high": float(c["high"]),
           "low": float(c["low"]),
           "close": float(c["close"]),
-          "volume": float(c["volume"])
-          if "volume" in c and c["volume"] is not None
-          else 0.0,
+          "volume": float(c["volume"]) if c.get("volume") is not None else 0.0,
       })
     df = pd.DataFrame(parsed_data)
     if not df.empty:
@@ -60,19 +133,6 @@ def fetch_twelvedata_m5_data(count=100):
   except Exception as e:
     print(f"เกิดข้อผิดพลาดในการดึงข้อมูลราคา: {e}")
     return pd.DataFrame()
-
-
-def send_telegram_alert(message):
-  """ส่งข้อความแจ้งเตือนเข้า Telegram"""
-  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    print("ไม่พบข้อมูล Telegram Credentials")
-    return
-  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-  payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-  try:
-    requests.post(url, json=payload)
-  except Exception as e:
-    print(f"เกิดข้อผิดพลาดในการส่ง Telegram: {e}")
 
 
 def get_google_sheet_handle():
@@ -92,24 +152,14 @@ def get_google_sheet_handle():
 
     spreadsheet = client.open(GOOGLE_SHEET_NAME)
 
-    # ดึงหรือสร้าง Worksheet "Signals"
     try:
       sheet = spreadsheet.worksheet("Signals")
     except gspread.exceptions.WorksheetNotFound:
       sheet = spreadsheet.add_worksheet(title="Signals", rows="1000", cols="10")
 
-    # ตรวจสอบว่ามี Header หรือยัง
     existing_data = sheet.get_all_values()
     if not existing_data:
-      headers = [
-          "Time (UTC+7)",
-          "Type",
-          "Entry",
-          "SL",
-          "TP",
-          "Status",
-          "PnL",
-      ]
+      headers = ["Time (UTC+7)", "Type", "Entry", "SL", "TP", "Status", "PnL"]
       sheet.append_row(headers)
 
     return sheet
@@ -124,19 +174,22 @@ def get_last_signal_time(sheet):
     return ""
   try:
     records = sheet.get_all_values()
-    if len(records) > 1:  # มีข้อมูลมากกว่าแค่ Header
-      return records[-1][0]  # คอลัมน์แรก (Time)
+    if len(records) > 1:
+      return records[-1][0]
   except Exception as e:
     print(f"เกิดข้อผิดพลาดในการเช็คเวลาสัญญาณล่าสุด: {e}")
   return ""
 
 
+# ==========================================
+# 3. SMC DETECTOR & MAIN SCANNER LOGIC
+# ==========================================
 def detect_smc_fvg(df):
   """ตรวจสอบโครงสร้าง Fair Value Gap (FVG) แบบ SMC"""
   if len(df) < 3:
     return None
 
-  i = len(df) - 2  # แท่งเทียนที่ปิดสมบูรณ์แล้ว
+  i = len(df) - 2
   if i < 2:
     return None
 
@@ -144,7 +197,6 @@ def detect_smc_fvg(df):
   c2 = df.iloc[i - 1]
   c3 = df.iloc[i]
 
-  # ฟอร์แมตเวลาให้เป็น String อ่านง่าย ชัดเจน (YYYY-MM-DD HH:MM:SS)
   time_str = df.index[i].strftime("%Y-%m-%d %H:%M:%S")
 
   # Bullish FVG
@@ -175,22 +227,18 @@ def detect_smc_fvg(df):
 def main():
   print("กำลังรันระบบ Gold SMC Scanner บน GitHub Actions (โซนเวลาไทย UTC+7)...")
 
-  # 1. เชื่อมต่อ Google Sheets
   sheet = get_google_sheet_handle()
 
-  # 2. ดึงข้อมูลราคา
   df = fetch_twelvedata_m5_data(100)
   if df.empty:
     print("ไม่สามารถดึงข้อมูลราคาได้")
     return
 
-  # 3. ตรวจจับสัญญาณ SMC
   signal = detect_smc_fvg(df)
   if not signal:
     print("ไม่พบสัญญาณ FVG ในรอบนี้")
     return
 
-  # 4. ตรวจสอบสัญญาณซ้ำจาก Google Sheets
   last_time_in_sheet = get_last_signal_time(sheet)
   if last_time_in_sheet == signal["time"]:
     print(
@@ -198,7 +246,7 @@ def main():
     )
     return
 
-  # 5. กรองด้วย Machine Learning (ถ้ามีไฟล์โมเดล)
+  # ตรวจสอบผ่าน Machine Learning Model
   ml_passed = True
   if os.path.exists(MODEL_FILE):
     try:
@@ -226,23 +274,27 @@ def main():
     except Exception as e:
       print(f"เกิดข้อผิดพลาดในระบบ ML Filter: {e}")
 
-  # 6. ส่งแจ้งเตือนและบันทึกข้อมูล
   if ml_passed:
-    msg = (
-        f"🚨 *Gold SMC Signal Detected!*\n"
-        f"Type: *{signal['type']}*\n"
-        f"Time (TH): `{signal['time']}` (UTC+7)\n"
-        f"Entry: `{signal['entry']:.2f}`\n"
-        f"SL: `{signal['sl']:.2f}`\n"
-        f"FVG Size: `{signal['fvg_size']:.2f}`"
-    )
-    send_telegram_alert(msg)
-
+    # คำนวณ Take Profit (RR 1:2)
+    risk = abs(signal["entry"] - signal["sl"])
     tp = (
-        signal["entry"] + (2.0 * abs(signal["entry"] - signal["sl"]))
+        signal["entry"] + (2.0 * risk)
         if signal["type"] == "BUY"
-        else signal["entry"] - (2.0 * abs(signal["entry"] - signal["sl"]))
+        else signal["entry"] - (2.0 * risk)
     )
+
+    # 1. ส่งสัญญาณเข้า Telegram
+    send_signal_alert(
+        symbol="XAU/USD",
+        signal_type=signal["type"],
+        entry=signal["entry"],
+        sl=signal["sl"],
+        tp=tp,
+        timeframe="M5",
+        fvg_size=signal.get("fvg_size"),
+    )
+
+    # 2. บันทึกลง Google Sheets
     row_data = [
         signal["time"],
         signal["type"],
