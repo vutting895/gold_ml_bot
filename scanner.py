@@ -181,6 +181,89 @@ def get_last_signal_time(sheet):
   return ""
 
 
+def update_open_trades_status(sheet, df_prices):
+  """ตรวจสอบและอัปเดตออเดอร์สถานะ OPEN ใน Google Sheets ว่าชน TP หรือ SL หรือยัง"""
+  if not sheet or df_prices.empty:
+    return
+
+  try:
+    records = sheet.get_all_records()
+    if not records:
+      return
+
+    print("🔍 กำลังตรวจสอบออเดอร์ที่เปิดค้างไว้ (OPEN)...")
+    tz_th = pytz.timezone("Asia/Bangkok")
+
+    for idx, row in enumerate(records, start=2):  # Row 1 คือ Header
+      if str(row.get("Status", "")).upper() == "OPEN":
+        entry = float(row["Entry"])
+        sl = float(row["SL"])
+        tp = float(row["TP"])
+        trade_type = str(row["Type"]).upper()
+
+        # แปลงเวลาของสัญญาณเป็น timezone-aware (Asia/Bangkok)
+        signal_time = pd.to_datetime(row["Time (UTC+7)"])
+        if signal_time.tzinfo is None:
+          signal_time = tz_th.localize(signal_time)
+
+        # กรองแท่งเทียนที่เกิดหลังจากสัญญาณ
+        df_index_tz = (
+            df_prices.index.tz_localize(tz_th)
+            if df_prices.index.tzinfo is None
+            else df_prices.index
+        )
+        future_candles = df_prices[df_index_tz > signal_time]
+
+        for _, candle in future_candles.iterrows():
+          high = candle["high"]
+          low = candle["low"]
+
+          # กรณี BUY Order
+          if trade_type == "BUY":
+            if low <= sl:  # ชน Stop Loss
+              pnl = round(sl - entry, 2)
+              sheet.update_cell(idx, 6, "LOSS")
+              sheet.update_cell(idx, 7, pnl)
+              print(
+                  f"❌ Order BUY เวลา {row['Time (UTC+7)']} ชน SL (PnL:"
+                  f" ${pnl})"
+              )
+              break
+            elif high >= tp:  # ชน Take Profit
+              pnl = round(tp - entry, 2)
+              sheet.update_cell(idx, 6, "WIN")
+              sheet.update_cell(idx, 7, pnl)
+              print(
+                  f"🎯 Order BUY เวลา {row['Time (UTC+7)']} ชน TP (PnL:"
+                  f" ${pnl})"
+              )
+              break
+
+          # กรณี SELL Order
+          elif trade_type == "SELL":
+            if high >= sl:  # ชน Stop Loss
+              pnl = round(entry - sl, 2)
+              sheet.update_cell(idx, 6, "LOSS")
+              sheet.update_cell(idx, 7, pnl)
+              print(
+                  f"❌ Order SELL เวลา {row['Time (UTC+7)']} ชน SL (PnL:"
+                  f" ${pnl})"
+              )
+              break
+            elif low <= tp:  # ชน Take Profit
+              pnl = round(entry - tp, 2)
+              sheet.update_cell(idx, 6, "WIN")
+              sheet.update_cell(idx, 7, pnl)
+              print(
+                  f"🎯 Order SELL เวลา {row['Time (UTC+7)']} ชน TP (PnL:"
+                  f" ${pnl})"
+              )
+              break
+
+  except Exception as e:
+    print(f"⚠️ เกิดข้อผิดพลาดในการอัปเดตสถานะออเดอร์: {e}")
+
+
 # ==========================================
 # 3. SMC DETECTOR & MAIN SCANNER LOGIC
 # ==========================================
@@ -227,6 +310,13 @@ def detect_smc_fvg(df):
 def main():
   print("กำลังรันระบบ Gold SMC Scanner บน GitHub Actions (โซนเวลาไทย UTC+7)...")
 
+  # 1. เช็กวันเสาร์ - อาทิตย์ (ตลาดทองคำปิด)
+  tz_th = pytz.timezone("Asia/Bangkok")
+  now_th = datetime.now(tz_th)
+  if now_th.weekday() in [5, 6]:
+    print("😴 ตลาดทองคำปิดทำการ (วันเสาร์-อาทิตย์) ข้ามการสแกน")
+    return
+
   sheet = get_google_sheet_handle()
 
   df = fetch_twelvedata_m5_data(100)
@@ -234,6 +324,11 @@ def main():
     print("ไม่สามารถดึงข้อมูลราคาได้")
     return
 
+  # 2. ตรวจสอบออเดอร์เก่าสถานะ OPEN ใน Google Sheets
+  if sheet:
+    update_open_trades_status(sheet, df)
+
+  # 3. ตรวจจับสัญญาณ SMC FVG ใหม่
   signal = detect_smc_fvg(df)
   if not signal:
     print("ไม่พบสัญญาณ FVG ในรอบนี้")
@@ -246,7 +341,7 @@ def main():
     )
     return
 
-  # ตรวจสอบผ่าน Machine Learning Model
+  # 4. ตรวจสอบผ่าน Machine Learning Model
   ml_passed = True
   if os.path.exists(MODEL_FILE):
     try:
@@ -283,7 +378,7 @@ def main():
         else signal["entry"] - (2.0 * risk)
     )
 
-    # 1. ส่งสัญญาณเข้า Telegram
+    # 5. ส่งสัญญาณเข้า Telegram
     send_signal_alert(
         symbol="XAU/USD",
         signal_type=signal["type"],
@@ -294,7 +389,7 @@ def main():
         fvg_size=signal.get("fvg_size"),
     )
 
-    # 2. บันทึกลง Google Sheets
+    # 6. บันทึกลง Google Sheets
     row_data = [
         signal["time"],
         signal["type"],
@@ -314,4 +409,4 @@ def main():
 
 if __name__ == "__main__":
   main()
-  
+              
