@@ -1,4 +1,3 @@
-# main_worker.py
 import logging
 import time
 import scanner
@@ -22,10 +21,9 @@ def run_worker():
         except Exception as e:
             logging.error(f"❌ เกิดข้อผิดพลาดใน Worker Loop: {e}", exc_info=True)
 
-        # หน่วงเวลา 300 วินาที (5 นาที) ให้สอดคล้องกับแท่งเทียน Timeframe M5
+        # หน่วงเวลา 300 วินาที (5 นาที) ตามแท่งเทียน M5
         time.sleep(300)
 
 
 if __name__ == "__main__":
     run_worker()
-    
