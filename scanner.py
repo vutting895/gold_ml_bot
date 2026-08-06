@@ -44,7 +44,7 @@ def add_indicators(df):
 
 
 def get_h1_trend_filter():
-  """[ข้อ 3] Multi-Timeframe Analysis: ดึงกราฟ H1 เพื่อเช็กแนวโน้มหลัก (EMA 20 vs EMA 50)"""
+  """Multi-Timeframe Analysis: ดึงกราฟ H1 เพื่อเช็กแนวโน้มหลัก (EMA 20 vs EMA 50)"""
   url = "https://api.twelvedata.com/time_series"
   params = {
       "symbol": "XAU/USD",
@@ -68,7 +68,6 @@ def get_h1_trend_filter():
       parsed_data.append({"close": float(c["close"])})
     df_h1 = pd.DataFrame(parsed_data)
 
-    # คำนวณ EMA 20 และ EMA 50 บน Timeframe H1
     df_h1["ema20"] = df_h1["close"].ewm(span=20, adjust=False).mean()
     df_h1["ema50"] = df_h1["close"].ewm(span=50, adjust=False).mean()
 
@@ -87,10 +86,97 @@ def get_h1_trend_filter():
 
 
 # ==========================================
-# 2. HIGH-IMPACT NEWS FILTER
+# 2. [VOOM FEATURE] DEMAND & SUPPLY ZONES DETECTOR
+# ==========================================
+def detect_demand_supply_zones(df, window=20):
+  """[ดึงข้อดีจาก Voom AI Sniper] คำนวณหา Demand Zone (โซนรับ) และ Supply Zone (โซนต้าน)
+
+  จาก Swing Low / Swing High ย้อนหลังเพื่อวัดระดับการเด้งของราคา
+  """
+  if len(df) < window:
+    return {"demand": None, "supply": None}
+
+  recent_df = df.iloc[-window:]
+
+  # Supply Zone: บริเวณสูงสุดของ Swing High ย้อนหลัง
+  supply_high = recent_df["high"].max()
+  supply_low = supply_high - (
+      recent_df["atr"].iloc[-1] * 0.5 if "atr" in recent_df.columns else 1.0
+  )
+
+  # Demand Zone: บริเวณต่ำสุดของ Swing Low ย้อนหลัง
+  demand_low = recent_df["low"].min()
+  demand_high = demand_low + (
+      recent_df["atr"].iloc[-1] * 0.5 if "atr" in recent_df.columns else 1.0
+  )
+
+  return {
+      "demand": (demand_low, demand_high),
+      "supply": (supply_low, supply_high),
+  }
+
+
+def is_price_near_zone(price, zone):
+  """เช็กว่าราคาปัจจุบันอยู่ในหรือใกล้เคียงกับ Demand/Supply Zone หรือไม่"""
+  if not zone:
+    return False
+  low_bound, high_bound = zone
+  return (low_bound - 0.5) <= price <= (high_bound + 0.5)
+
+
+# ==========================================
+# 3. [VOOM FEATURE] SNIPER SCORE ENGINE
+# ==========================================
+def calculate_sniper_score(
+    signal_type, price, fvg_size, atr, rsi, mtf_permission, zones
+):
+  """[ดึงข้อดีจาก Voom AI Sniper] คำนวณ Sniper Score (0-100) ประเมินความน่าจะเป็นและคุณภาพสัญญาณ
+
+  คัดเฉพาะสัญญาณเกรด A+ (Score >= 70)
+  """
+  score = 40  # คะแนนฐานเริ่มต้น (Base Score)
+
+  # 1. เช็กความสอดคล้องกับ H1 MTF Trend (+20 คะแนน)
+  if (signal_type == "BUY" and mtf_permission == "BUY_ONLY") or (
+      signal_type == "SELL" and mtf_permission == "SELL_ONLY"
+  ):
+    score += 20
+  elif mtf_permission == "BOTH":
+    score += 10
+
+  # 2. เช็กความสอดคล้องกับ Demand / Supply Zone (+20 คะแนน)
+  demand_zone = zones.get("demand")
+  supply_zone = zones.get("supply")
+
+  if signal_type == "BUY" and is_price_near_zone(price, demand_zone):
+    score += 20
+    zone_info = "Demand Zone 🟢"
+  elif signal_type == "SELL" and is_price_near_zone(price, supply_zone):
+    score += 20
+    zone_info = "Supply Zone 🔴"
+  else:
+    zone_info = "Mid-Range / Breakout ⚪"
+
+  # 3. เช็กขนาด FVG Gap เทียบกับ ATR Momentum (+10 คะแนน)
+  if fvg_size >= (1.2 * atr):
+    score += 10
+  elif fvg_size >= (0.8 * atr):
+    score += 5
+
+  # 4. เช็กค่า RSI Overbought / Oversold Confirmation (+10 คะแนน)
+  if signal_type == "BUY" and rsi < 50:
+    score += 10
+  elif signal_type == "SELL" and rsi > 50:
+    score += 10
+
+  return min(score, 100), zone_info
+
+
+# ==========================================
+# 4. HIGH-IMPACT NEWS FILTER
 # ==========================================
 def is_high_impact_news_near(window_minutes=30):
-  """[ข้อ 1] ตรวจสอบข่าวแรงเกี่ยวกับ USD (High Impact) ก่อนและหลังข่าวออก 30 นาที"""
+  """ตรวจสอบข่าวแรงเกี่ยวกับ USD (High Impact) ก่อนและหลังข่าวออก 30 นาที"""
   try:
     url = "https://nws.forexfactory.com/news/get_news_json.php"
     response = requests.get(url, timeout=5)
@@ -102,7 +188,7 @@ def is_high_impact_news_near(window_minutes=30):
 
     for news in news_data:
       if news.get("country") == "USD" and news.get("impact") == "High":
-        news_time_str = news.get("date")  # ISO Format
+        news_time_str = news.get("date")
         if news_time_str:
           news_dt = pd.to_datetime(news_time_str).tz_convert(pytz.utc)
           diff_minutes = abs((news_dt - now_utc).total_seconds()) / 60.0
@@ -112,25 +198,20 @@ def is_high_impact_news_near(window_minutes=30):
             return True, title
     return False, ""
   except Exception:
-    # หาก API ข่าวติดปัญหา ให้รันระบบสแกนต่อโดยไม่ระงับ
     return False, ""
 
 
 # ==========================================
-# 3. DYNAMIC POSITION SIZING CALCULATOR
+# 5. DYNAMIC POSITION SIZING CALCULATOR
 # ==========================================
 def calculate_lot_size(balance=10000.0, risk_percent=1.0, entry=0.0, sl=0.0):
-  """[ข้อ 2] คำนวณขนาด Lot Size อัตโนมัติสำหรับ XAU/USD ตามหลัก Money Management
-
-  (ทองคำ 1 Standard Lot = 100 oz / $1 ที่เปลี่ยนไปต่อ 1.0 Lot = $100)
-  """
+  """คำนวณขนาด Lot Size อัตโนมัติสำหรับ XAU/USD ตามหลัก Money Management"""
   try:
     risk_amount = balance * (risk_percent / 100.0)
     risk_distance = abs(entry - sl)
     if risk_distance <= 0:
       return 0.01
 
-    # 1 Lot ทองคำ: ย่อ/ขยาย $1 = $100
     lot_size = risk_amount / (risk_distance * 100.0)
     return max(round(lot_size, 2), 0.01)
   except Exception:
@@ -138,7 +219,7 @@ def calculate_lot_size(balance=10000.0, risk_percent=1.0, entry=0.0, sl=0.0):
 
 
 # ==========================================
-# 4. TELEGRAM SYSTEM & COMMAND HANDLER
+# 6. TELEGRAM SYSTEM & COMMAND HANDLER
 # ==========================================
 def send_telegram_message(message: str) -> bool:
   """ส่งข้อความไปยัง Telegram Bot ผ่าน HTTP POST"""
@@ -164,9 +245,17 @@ def send_telegram_message(message: str) -> bool:
 
 
 def send_signal_alert(
-    symbol, signal_type, entry, sl, tp, timeframe="M5", fvg_size=None
+    symbol,
+    signal_type,
+    entry,
+    sl,
+    tp,
+    timeframe="M5",
+    fvg_size=None,
+    sniper_score=0,
+    zone_info="",
 ):
-  """การ์ดแจ้งเตือนสัญญาณเทรด พร้อม Lot Size แนะนำ"""
+  """การ์ดแจ้งเตือนสัญญาณเทรด เพิ่ม Sniper Score และ Zone จาก Voom AI Sniper"""
   tz_th = pytz.timezone("Asia/Bangkok")
   now_th = datetime.now(tz_th).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -178,15 +267,18 @@ def send_signal_alert(
   reward_pips = abs(tp - entry)
   rr_ratio = round(reward_pips / risk_pips, 2) if risk_pips > 0 else 0.0
 
-  # คำนวณ Lot Size แนะนำตามพอร์ตตัวอย่าง ($10,000 Risk 1%)
   recommended_lot = calculate_lot_size(
       balance=10000.0, risk_percent=1.0, entry=entry, sl=sl
   )
+  score_badge = "🔥 A+ EXCELLENT" if sniper_score >= 80 else "✅ A GOOD"
 
   message = (
-      f"🚨 <b>{symbol} {timeframe} SMC SIGNAL</b> {trend_icon}\n"
+      f"🎯 <b>{symbol} {timeframe} SNIPER SIGNAL ({score_badge})</b>"
+      f" {trend_icon}\n"
       f"━━━━━━━━━━━━━━━━━━\n"
       f"<b>Type:</b> {type_emoji}\n"
+      f"<b>Sniper Score:</b> <code>{sniper_score}/100</code> ⭐️\n"
+      f"<b>Market Zone:</b> <code>{zone_info}</code>\n"
       f"<b>Time (TH):</b> <code>{now_th}</code> (UTC+7)\n\n"
       f"🎯 <b>Entry Price:</b> <code>${entry:.2f}</code>\n"
       f"🛑 <b>Stop Loss (SL):</b> <code>${sl:.2f}</code> (Risk:"
@@ -203,14 +295,14 @@ def send_signal_alert(
 
   message += (
       "━━━━━━━━━━━━━━━━━━\n"
-      "🤖 <i>Validated by News Filter, MTF, Dynamic SL & ML</i>\n"
+      "🤖 <i>Validated by Voom Sniper Engine, News Filter, MTF & ML</i>\n"
   )
 
   return send_telegram_message(message)
 
 
 def process_telegram_commands(sheet):
-  """[ข้อ 4] Interactive Telegram Bot: อ่านคำสั่งจากผู้ใช้ (/status, /scan, /help)"""
+  """Interactive Telegram Bot: อ่านคำสั่งจากผู้ใช้ (/status, /help)"""
   if not TELEGRAM_BOT_TOKEN:
     return
 
@@ -275,7 +367,7 @@ def process_telegram_commands(sheet):
 
 
 # ==========================================
-# 5. DATA FETCHING & GOOGLE SHEETS
+# 7. DATA FETCHING & GOOGLE SHEETS
 # ==========================================
 def fetch_twelvedata_m5_data(count=100):
   """ดึงข้อมูลราคาย้อนหลัง M5 XAU/USD จาก Twelve Data API"""
@@ -443,7 +535,7 @@ def update_open_trades_status(sheet, df_prices):
 
 
 # ==========================================
-# 6. SMC DETECTOR & MAIN SCANNER LOGIC
+# 8. SMC DETECTOR & MAIN SCANNER LOGIC
 # ==========================================
 def detect_smc_fvg(df):
   """ตรวจจับ Fair Value Gap (FVG) ร่วมกับ Dynamic ATR SL"""
@@ -497,7 +589,10 @@ def detect_smc_fvg(df):
 
 
 def main():
-  print("🚀 เริ่มต้นระบบ Gold SMC Full-Featured Scanner (UTC+7)...")
+  print(
+      "🚀 เริ่มต้นระบบ Gold SMC Full-Featured Scanner with Voom Sniper Engine"
+      " (UTC+7)..."
+  )
 
   # 1. เช็กวันเสาร์-อาทิตย์ (ตลาดปิด)
   tz_th = pytz.timezone("Asia/Bangkok")
@@ -511,7 +606,7 @@ def main():
   # 2. อ่านและตอบรับคำสั่งผู้ใช้ผ่าน Telegram (/status, /help)
   process_telegram_commands(sheet)
 
-  # 3. [ข้อ 1] เช็ก News Filter (ข่าวแรง USD)
+  # 3. เช็ก News Filter (ข่าวแรง USD)
   is_news, news_title = is_high_impact_news_near(window_minutes=30)
   if is_news:
     print(
@@ -530,10 +625,13 @@ def main():
   if sheet:
     update_open_trades_status(sheet, df)
 
-  # 6. [ข้อ 3] เช็ก Multi-Timeframe Filter (H1 Trend)
+  # 6. เช็ก Multi-Timeframe Filter (H1 Trend)
   mtf_permission = get_h1_trend_filter()
 
-  # 7. ตรวจจับสัญญาณ SMC FVG ใหม่
+  # 7. [VOOM FEATURE] คำนวณ Demand / Supply Zones
+  zones = detect_demand_supply_zones(df, window=20)
+
+  # 8. ตรวจจับสัญญาณ SMC FVG ใหม่
   signal = detect_smc_fvg(df)
   if not signal:
     print("ไม่พบสัญญาณ FVG ในรอบนี้")
@@ -553,71 +651,7 @@ def main():
     )
     return
 
-  # เช็กสัญญาณซ้ำ
-  last_time_in_sheet = get_last_signal_time(sheet)
-  if last_time_in_sheet == signal["time"]:
-    print(f"สัญญาณเวลา {signal['time']} ถูกแจ้งเตือนไปแล้ว ข้ามการทำงาน")
-    return
-
-  # 8. กรองสัญญาณผ่าน Machine Learning Model
-  ml_passed = True
-  if os.path.exists(MODEL_FILE):
-    try:
-      model = joblib.load(MODEL_FILE)
-      atr = signal.get("atr", 1.5)
-      rsi = signal.get("rsi", 50.0)
-
-      t = pd.to_datetime(signal["time"])
-      hour = t.hour
-      dayofweek = t.dayofweek
-      risk_dist = abs(signal["entry"] - signal["sl"])
-
-      features = np.array(
-          [[signal["fvg_size"], atr, rsi, hour, dayofweek, risk_dist]]
-      )
-      pred = model.predict(features)[0]
-      if pred == 0:
-        ml_passed = False
-        print("สัญญาณถูกกรองออกโดยโมเดล Machine Learning")
-    except Exception as e:
-      print(f"เกิดข้อผิดพลาดในระบบ ML Filter: {e}")
-
-  if ml_passed:
-    risk = abs(signal["entry"] - signal["sl"])
-    tp = (
-        signal["entry"] + (2.0 * risk)
-        if signal["type"] == "BUY"
-        else signal["entry"] - (2.0 * risk)
-    )
-
-    # 9. ส่งสัญญาณเข้า Telegram
-    send_signal_alert(
-        symbol="XAU/USD",
-        signal_type=signal["type"],
-        entry=signal["entry"],
-        sl=signal["sl"],
-        tp=tp,
-        timeframe="M5",
-        fvg_size=signal.get("fvg_size"),
-    )
-
-    # 10. บันทึกลง Google Sheets
-    row_data = [
-        signal["time"],
-        signal["type"],
-        signal["entry"],
-        signal["sl"],
-        tp,
-        "OPEN",
-        0.0,
-    ]
-
-    if sheet:
-      sheet.append_row(row_data)
-      print("บันทึกข้อมูลลง Google Sheets เรียบร้อยแล้ว")
-
-    print(f"ส่งสัญญาณเวลา {signal['time']} (UTC+7) เรียบร้อยแล้ว")
-
-
-if __name__ == "__main__":
-  main()
+  # 9. [VOOM FEATURE] คำนวณ Sniper Score (0-100)
+  sniper_score, zone_info = calculate_sniper_score(
+      signal_type=signal["type"],
+      price=s
