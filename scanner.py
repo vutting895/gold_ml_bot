@@ -44,7 +44,7 @@ def add_indicators(df):
 
 
 def get_h1_trend_filter():
-    """Multi-Timeframe Analysis: ดึงกราฟ H1 เพื่อเช็กแนวโน้มหลัก (EMA 20 vs EMA 50)"""
+    """Multi-Timeframe Analysis: ดึงข้อมูล H1 เพื่อเช็กแนวโน้มหลัก (EMA 20 vs EMA 50)"""
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": "XAU/USD",
@@ -88,7 +88,7 @@ def get_h1_trend_filter():
 # 2. DEMAND & SUPPLY ZONES DETECTOR
 # ==========================================
 def detect_demand_supply_zones(df, window=20):
-    """คำนวณหา Demand Zone (โซนรับ) และ Supply Zone (โซนต้าน)"""
+    """คำนวณหา Demand Zone (แนวรับ) และ Supply Zone (แนวต้าน)"""
     if len(df) < window:
         return {"demand": None, "supply": None}
 
@@ -120,11 +120,13 @@ def is_price_near_zone(price, zone):
 # 3. SNIPER SCORE ENGINE
 # ==========================================
 def calculate_sniper_score(signal_type, price, fvg_size, atr, rsi, mtf_permission, zones):
-    """คำนวณ Sniper Score (0-100) ประเมินความน่าจะเป็นและคุณภาพสัญญาณ"""
+    """คำนวณ Sniper Score (0-100) ประเมินความน่าจะเป็นและคุณภาพของสัญญาณ"""
     score = 40  # Base Score
 
     # 1. เช็กความสอดคล้องกับ H1 MTF Trend (+20 คะแนน)
-    if (signal_type == "BUY" and mtf_permission == "BUY_ONLY") or (signal_type == "SELL" and mtf_permission == "SELL_ONLY"):
+    if (signal_type == "BUY" and mtf_permission == "BUY_ONLY") or (
+        signal_type == "SELL" and mtf_permission == "SELL_ONLY"
+    ):
         score += 20
     elif mtf_permission == "BOTH":
         score += 10
@@ -407,7 +409,7 @@ def get_google_sheet_handle():
 
 
 def get_last_signal_time(sheet):
-    """ดึงเวลาสัญญาณล่าสุด"""
+    """ดึงเวลาของสัญญาณล่าสุด"""
     if not sheet:
         return ""
     try:
@@ -554,4 +556,4 @@ def main():
     # 3. เช็ก News Filter (ข่าวแรง USD)
     is_news, news_title = is_high_impact_news_near(window_minutes=30)
     if is_news:
-        print(f"⚠️ [News Filter] งดส่งสัญญาณเนื่องจากใกล้ช่วงข่าวแรง
+        print(f"⚠️ [News Filter] งดส่งสัญญาณเน
