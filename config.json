@@ -1,0 +1,8 @@
+{
+  "symbol": "XAU/USD",
+  "timeframe": "M5",
+  "risk_percent": 1.0,
+  "account_balance": 10000.0,
+  "news_window_minutes": 30,
+  "use_mtf_filter": true
+}
