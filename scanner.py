@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import joblib
 import gspread
 from google.oauth2.service_account import Credentials
@@ -20,10 +20,10 @@ MODEL_FILE = "gold_ml_filter.pkl"
 
 
 # ==========================================
-# 1. TECHNICAL INDICATORS (CONSISTENT ENGINE)
+# 1. TECHNICAL INDICATORS & MTF ANALYSIS
 # ==========================================
 def add_indicators(df):
-  """คำนวณ ATR และ RSI ตามมาตรฐานสากลเพื่อความแม่นยำของ ML และ Dynamic SL"""
+  """คำนวณ ATR (14) และ RSI (14) ตามมาตรฐานสากล"""
   df = df.copy()
 
   # 1. True Range & ATR (14)
@@ -43,15 +43,107 @@ def add_indicators(df):
   return df
 
 
+def get_h1_trend_filter():
+  """[ข้อ 3] Multi-Timeframe Analysis: ดึงกราฟ H1 เพื่อเช็กแนวโน้มหลัก (EMA 20 vs EMA 50)"""
+  url = "https://api.twelvedata.com/time_series"
+  params = {
+      "symbol": "XAU/USD",
+      "interval": "1h",
+      "outputsize": 60,
+      "apikey": TWELVE_DATA_API_KEY,
+      "format": "JSON",
+      "timezone": "Asia/Bangkok",
+  }
+  try:
+    response = requests.get(url, params=params, timeout=10)
+    data = response.json()
+    if "values" not in data:
+      print(
+          "⚠️ [MTF Filter] ไม่สามารถดึงกราฟ H1 ได้ ใช้การสแกนแบบไม่กรอง MTF"
+      )
+      return "BOTH"
+
+    parsed_data = []
+    for c in reversed(data["values"]):
+      parsed_data.append({"close": float(c["close"])})
+    df_h1 = pd.DataFrame(parsed_data)
+
+    # คำนวณ EMA 20 และ EMA 50 บน Timeframe H1
+    df_h1["ema20"] = df_h1["close"].ewm(span=20, adjust=False).mean()
+    df_h1["ema50"] = df_h1["close"].ewm(span=50, adjust=False).mean()
+
+    latest = df_h1.iloc[-1]
+    if latest["ema20"] > latest["ema50"]:
+      print("📈 [MTF Filter] H1 Trend = BULLISH (อนุญาตเฉพาะ BUY)")
+      return "BUY_ONLY"
+    elif latest["ema20"] < latest["ema50"]:
+      print("📉 [MTF Filter] H1 Trend = BEARISH (อนุญาตเฉพาะ SELL)")
+      return "SELL_ONLY"
+    return "BOTH"
+
+  except Exception as e:
+    print(f"⚠️ [MTF Filter Error]: {e}")
+    return "BOTH"
+
+
 # ==========================================
-# 2. TELEGRAM NOTIFICATION SYSTEM (HTML)
+# 2. HIGH-IMPACT NEWS FILTER
+# ==========================================
+def is_high_impact_news_near(window_minutes=30):
+  """[ข้อ 1] ตรวจสอบข่าวแรงเกี่ยวกับ USD (High Impact) ก่อนและหลังข่าวออก 30 นาที"""
+  try:
+    url = "https://nws.forexfactory.com/news/get_news_json.php"
+    response = requests.get(url, timeout=5)
+    if response.status_code != 200:
+      return False, ""
+
+    news_data = response.json()
+    now_utc = datetime.now(pytz.utc)
+
+    for news in news_data:
+      if news.get("country") == "USD" and news.get("impact") == "High":
+        news_time_str = news.get("date")  # ISO Format
+        if news_time_str:
+          news_dt = pd.to_datetime(news_time_str).tz_convert(pytz.utc)
+          diff_minutes = abs((news_dt - now_utc).total_seconds()) / 60.0
+
+          if diff_minutes <= window_minutes:
+            title = news.get("title", "USD High Impact News")
+            return True, title
+    return False, ""
+  except Exception:
+    # หาก API ข่าวติดปัญหา ให้รันระบบสแกนต่อโดยไม่ระงับ
+    return False, ""
+
+
+# ==========================================
+# 3. DYNAMIC POSITION SIZING CALCULATOR
+# ==========================================
+def calculate_lot_size(balance=10000.0, risk_percent=1.0, entry=0.0, sl=0.0):
+  """[ข้อ 2] คำนวณขนาด Lot Size อัตโนมัติสำหรับ XAU/USD ตามหลัก Money Management
+
+  (ทองคำ 1 Standard Lot = 100 oz / $1 ที่เปลี่ยนไปต่อ 1.0 Lot = $100)
+  """
+  try:
+    risk_amount = balance * (risk_percent / 100.0)
+    risk_distance = abs(entry - sl)
+    if risk_distance <= 0:
+      return 0.01
+
+    # 1 Lot ทองคำ: ย่อ/ขยาย $1 = $100
+    lot_size = risk_amount / (risk_distance * 100.0)
+    return max(round(lot_size, 2), 0.01)
+  except Exception:
+    return 0.01
+
+
+# ==========================================
+# 4. TELEGRAM SYSTEM & COMMAND HANDLER
 # ==========================================
 def send_telegram_message(message: str) -> bool:
-  """ฟังก์ชันส่งข้อความไปยัง Telegram Bot ผ่าน HTTP POST (ใช้ HTML Format)"""
+  """ส่งข้อความไปยัง Telegram Bot ผ่าน HTTP POST"""
   if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    print(
-        "❌ [Telegram Error] ไม่พบ TELEGRAM_BOT_TOKEN หรือ TELEGRAM_CHAT_ID"
-    )
+    print("❌ [Telegram Error] ไม่พบ Token หรือ Chat ID")
     return False
 
   url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -61,27 +153,20 @@ def send_telegram_message(message: str) -> bool:
       "parse_mode": "HTML",
       "disable_web_page_preview": True,
   }
-
   try:
-    response = requests.post(url, json=payload, timeout=10)
-    response.raise_for_status()
+    res = requests.post(url, json=payload, timeout=10)
+    res.raise_for_status()
     print("✅ [Telegram] ส่งข้อความแจ้งเตือนสำเร็จ")
     return True
   except Exception as e:
-    print(f"❌ [Telegram Error] ไม่สามารถส่งข้อความได้: {e}")
+    print(f"❌ [Telegram Error]: {e}")
     return False
 
 
 def send_signal_alert(
-    symbol: str,
-    signal_type: str,
-    entry: float,
-    sl: float,
-    tp: float,
-    timeframe: str = "M5",
-    fvg_size: float = None,
-) -> bool:
-  """จัดรูปแบบการ์ดสัญญาณแจ้งเตือน SMC และส่งเข้า Telegram"""
+    symbol, signal_type, entry, sl, tp, timeframe="M5", fvg_size=None
+):
+  """การ์ดแจ้งเตือนสัญญาณเทรด พร้อม Lot Size แนะนำ"""
   tz_th = pytz.timezone("Asia/Bangkok")
   now_th = datetime.now(tz_th).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -92,6 +177,11 @@ def send_signal_alert(
   risk_pips = abs(entry - sl)
   reward_pips = abs(tp - entry)
   rr_ratio = round(reward_pips / risk_pips, 2) if risk_pips > 0 else 0.0
+
+  # คำนวณ Lot Size แนะนำตามพอร์ตตัวอย่าง ($10,000 Risk 1%)
+  recommended_lot = calculate_lot_size(
+      balance=10000.0, risk_percent=1.0, entry=entry, sl=sl
+  )
 
   message = (
       f"🚨 <b>{symbol} {timeframe} SMC SIGNAL</b> {trend_icon}\n"
@@ -104,6 +194,8 @@ def send_signal_alert(
       f"🏁 <b>Take Profit (TP):</b> <code>${tp:.2f}</code> (Reward:"
       f" ${reward_pips:.2f})\n"
       f"⚖️ <b>Risk : Reward:</b> <code>1:{rr_ratio}</code>\n"
+      f"💼 <b>Recommended Lot (Risk 1% / $10k):</b>"
+      f" <code>{recommended_lot} Lot</code>\n"
   )
 
   if fvg_size:
@@ -111,17 +203,82 @@ def send_signal_alert(
 
   message += (
       "━━━━━━━━━━━━━━━━━━\n"
-      "🤖 <i>Validated by Dynamic SL & ML Filter System</i>\n"
+      "🤖 <i>Validated by News Filter, MTF, Dynamic SL & ML</i>\n"
   )
 
   return send_telegram_message(message)
 
 
+def process_telegram_commands(sheet):
+  """[ข้อ 4] Interactive Telegram Bot: อ่านคำสั่งจากผู้ใช้ (/status, /scan, /help)"""
+  if not TELEGRAM_BOT_TOKEN:
+    return
+
+  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+  try:
+    res = requests.get(url, timeout=5)
+    if res.status_code != 200:
+      return
+
+    updates = res.json().get("result", [])
+    for update in updates:
+      message_data = update.get("message", {})
+      text = message_data.get("text", "").strip()
+      chat_id = message_data.get("chat", {}).get("id")
+
+      if str(chat_id) != str(TELEGRAM_CHAT_ID) or not text.startswith("/"):
+        continue
+
+      if text == "/status":
+        if sheet:
+          records = sheet.get_all_records()
+          df_rec = pd.DataFrame(records)
+          if not df_rec.empty and "Status" in df_rec.columns:
+            wins = len(df_rec[df_rec["Status"].str.upper() == "WIN"])
+            losses = len(df_rec[df_rec["Status"].str.upper() == "LOSS"])
+            opens = len(df_rec[df_rec["Status"].str.upper() == "OPEN"])
+            total = wins + losses
+            wr = (wins / total * 100) if total > 0 else 0.0
+
+            pnl = (
+                pd.to_numeric(df_rec["PnL"], errors="coerce")
+                .fillna(0.0)
+                .sum()
+            )
+
+            msg = (
+                f"📊 <b>BOT STATUS REPORT</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🟢 Win: <b>{wins}</b> | 🔴 Loss: <b>{losses}</b> | ⏳ Open:"
+                f" <b>{opens}</b>\n"
+                f"🎯 Win Rate: <b>{wr:.1f}%</b>\n"
+                f"💰 Total PnL: <b>${pnl:+.2f}</b>"
+            )
+          else:
+            msg = "ℹ️ ยังไม่มีประวัติการเทรดในระบบ"
+        else:
+          msg = "❌ ไม่สามารถเชื่อมต่อ Google Sheets ได้"
+        send_telegram_message(msg)
+
+      elif text == "/help":
+        msg = (
+            "🤖 <b>COMMAND MENU</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "/status - ตรวจสอบสรุปผล Win Rate และ PnL\n"
+            "/scan - สั่งรันสแกนตลาดทองคำทันที\n"
+            "/help - แสดงเมนูช่วยเหลือ"
+        )
+        send_telegram_message(msg)
+
+  except Exception as e:
+    print(f"⚠️ [Telegram Command Handler Error]: {e}")
+
+
 # ==========================================
-# 3. DATA FETCHING & GOOGLE SHEETS SYSTEM
+# 5. DATA FETCHING & GOOGLE SHEETS
 # ==========================================
 def fetch_twelvedata_m5_data(count=100):
-  """ดึงข้อมูลราคาย้อนหลัง M5 สำหรับ XAU/USD จาก Twelve Data API (โซนเวลาไทย Asia/Bangkok UTC+7)"""
+  """ดึงข้อมูลราคาย้อนหลัง M5 XAU/USD จาก Twelve Data API"""
   url = "https://api.twelvedata.com/time_series"
   params = {
       "symbol": "XAU/USD",
@@ -161,7 +318,7 @@ def fetch_twelvedata_m5_data(count=100):
 
 
 def get_google_sheet_handle():
-  """จัดการเชื่อมต่อและดึง Object ของ Worksheet 'Signals'"""
+  """เชื่อมต่อ Google Sheets"""
   if not GOOGLE_CREDENTIALS_JSON:
     print("ไม่พบข้อมูล Google Credentials JSON")
     return None
@@ -194,7 +351,7 @@ def get_google_sheet_handle():
 
 
 def get_last_signal_time(sheet):
-  """ดึงเวลาของสัญญาณล่าสุดจาก Google Sheets เพื่อเช็คการส่งซ้ำ"""
+  """ดึงเวลาสัญญาณล่าสุด"""
   if not sheet:
     return ""
   try:
@@ -207,7 +364,7 @@ def get_last_signal_time(sheet):
 
 
 def update_open_trades_status(sheet, df_prices):
-  """ตรวจสอบและอัปเดตออเดอร์สถานะ OPEN ใน Google Sheets ว่าชน TP หรือ SL หรือยัง"""
+  """อัปเดตออเดอร์สถานะ OPEN ใน Google Sheets ว่าชน TP หรือ SL หรือยัง"""
   if not sheet or df_prices.empty:
     return
 
@@ -219,7 +376,7 @@ def update_open_trades_status(sheet, df_prices):
     print("🔍 กำลังตรวจสอบออเดอร์ที่เปิดค้างไว้ (OPEN)...")
     tz_th = pytz.timezone("Asia/Bangkok")
 
-    for idx, row in enumerate(records, start=2):  # Row 1 คือ Header
+    for idx, row in enumerate(records, start=2):
       if str(row.get("Status", "")).upper() == "OPEN":
         entry = float(row["Entry"])
         sl = float(row["SL"])
@@ -242,7 +399,7 @@ def update_open_trades_status(sheet, df_prices):
           low = candle["low"]
 
           if trade_type == "BUY":
-            if low <= sl:  # ชน SL
+            if low <= sl:
               pnl = round(sl - entry, 2)
               sheet.update_cell(idx, 6, "LOSS")
               sheet.update_cell(idx, 7, pnl)
@@ -251,7 +408,7 @@ def update_open_trades_status(sheet, df_prices):
                   f" ${pnl})"
               )
               break
-            elif high >= tp:  # ชน TP
+            elif high >= tp:
               pnl = round(tp - entry, 2)
               sheet.update_cell(idx, 6, "WIN")
               sheet.update_cell(idx, 7, pnl)
@@ -262,7 +419,7 @@ def update_open_trades_status(sheet, df_prices):
               break
 
           elif trade_type == "SELL":
-            if high >= sl:  # ชน SL
+            if high >= sl:
               pnl = round(entry - sl, 2)
               sheet.update_cell(idx, 6, "LOSS")
               sheet.update_cell(idx, 7, pnl)
@@ -271,7 +428,7 @@ def update_open_trades_status(sheet, df_prices):
                   f" ${pnl})"
               )
               break
-            elif low <= tp:  # ชน TP
+            elif low <= tp:
               pnl = round(entry - tp, 2)
               sheet.update_cell(idx, 6, "WIN")
               sheet.update_cell(idx, 7, pnl)
@@ -286,10 +443,10 @@ def update_open_trades_status(sheet, df_prices):
 
 
 # ==========================================
-# 4. SMC DETECTOR & MAIN SCANNER LOGIC
+# 6. SMC DETECTOR & MAIN SCANNER LOGIC
 # ==========================================
 def detect_smc_fvg(df):
-  """ตรวจสอบโครงสร้าง Fair Value Gap (FVG) แบบ SMC + Dynamic SL ตามค่า ATR"""
+  """ตรวจจับ Fair Value Gap (FVG) ร่วมกับ Dynamic ATR SL"""
   if len(df) < 3:
     return None
 
@@ -303,7 +460,6 @@ def detect_smc_fvg(df):
 
   time_str = df.index[i].strftime("%Y-%m-%d %H:%M:%S")
 
-  # คำนวณ Dynamic Buffer จาก ATR (ใช้ 0.5 * ATR หรือขั้นต่ำ 1.0$)
   latest_atr = (
       df["atr"].iloc[i]
       if "atr" in df.columns and not pd.isna(df["atr"].iloc[i])
@@ -341,9 +497,9 @@ def detect_smc_fvg(df):
 
 
 def main():
-  print("กำลังรันระบบ Gold SMC Scanner บน GitHub Actions (โซนเวลาไทย UTC+7)...")
+  print("🚀 เริ่มต้นระบบ Gold SMC Full-Featured Scanner (UTC+7)...")
 
-  # 1. เช็กวันเสาร์ - อาทิตย์ (ตลาดทองคำปิด)
+  # 1. เช็กวันเสาร์-อาทิตย์ (ตลาดปิด)
   tz_th = pytz.timezone("Asia/Bangkok")
   now_th = datetime.now(tz_th)
   if now_th.weekday() in [5, 6]:
@@ -352,29 +508,58 @@ def main():
 
   sheet = get_google_sheet_handle()
 
+  # 2. อ่านและตอบรับคำสั่งผู้ใช้ผ่าน Telegram (/status, /help)
+  process_telegram_commands(sheet)
+
+  # 3. [ข้อ 1] เช็ก News Filter (ข่าวแรง USD)
+  is_news, news_title = is_high_impact_news_near(window_minutes=30)
+  if is_news:
+    print(
+        f"⚠️ [News Filter Triggered] มีข่าวแรง USD ({news_title})"
+        " งดส่งสัญญาณในรอบนี้"
+    )
+    return
+
+  # 4. ดึงข้อมูลราคา M5
   df = fetch_twelvedata_m5_data(100)
   if df.empty:
     print("ไม่สามารถดึงข้อมูลราคาได้")
     return
 
-  # 2. ตรวจสอบและอัปเดตสถานะออเดอร์ค้างเก่า (WIN/LOSS)
+  # 5. อัปเดตสถานะออเดอร์เก่า (WIN/LOSS)
   if sheet:
     update_open_trades_status(sheet, df)
 
-  # 3. ตรวจจับสัญญาณ SMC FVG ใหม่
+  # 6. [ข้อ 3] เช็ก Multi-Timeframe Filter (H1 Trend)
+  mtf_permission = get_h1_trend_filter()
+
+  # 7. ตรวจจับสัญญาณ SMC FVG ใหม่
   signal = detect_smc_fvg(df)
   if not signal:
     print("ไม่พบสัญญาณ FVG ในรอบนี้")
     return
 
-  last_time_in_sheet = get_last_signal_time(sheet)
-  if last_time_in_sheet == signal["time"]:
+  # กรองตาม Multi-Timeframe Analysis
+  if mtf_permission == "BUY_ONLY" and signal["type"] != "BUY":
     print(
-        f"สัญญาณเวลา {signal['time']} (UTC+7) ถูกแจ้งเตือนไปแล้ว ข้ามการทำงาน"
+        f"🚫 [MTF Blocked] สัญญาณ {signal['type']} ถูกปฏิเสธเนื่องจาก H1 เป็น"
+        " Bullish Trend"
+    )
+    return
+  elif mtf_permission == "SELL_ONLY" and signal["type"] != "SELL":
+    print(
+        f"🚫 [MTF Blocked] สัญญาณ {signal['type']} ถูกปฏิเสธเนื่องจาก H1 เป็น"
+        " Bearish Trend"
     )
     return
 
-  # 4. ตรวจสอบผ่าน Machine Learning Model
+  # เช็กสัญญาณซ้ำ
+  last_time_in_sheet = get_last_signal_time(sheet)
+  if last_time_in_sheet == signal["time"]:
+    print(f"สัญญาณเวลา {signal['time']} ถูกแจ้งเตือนไปแล้ว ข้ามการทำงาน")
+    return
+
+  # 8. กรองสัญญาณผ่าน Machine Learning Model
   ml_passed = True
   if os.path.exists(MODEL_FILE):
     try:
@@ -398,7 +583,6 @@ def main():
       print(f"เกิดข้อผิดพลาดในระบบ ML Filter: {e}")
 
   if ml_passed:
-    # คำนวณ Take Profit (RR 1:2)
     risk = abs(signal["entry"] - signal["sl"])
     tp = (
         signal["entry"] + (2.0 * risk)
@@ -406,7 +590,7 @@ def main():
         else signal["entry"] - (2.0 * risk)
     )
 
-    # 5. ส่งสัญญาณเข้า Telegram
+    # 9. ส่งสัญญาณเข้า Telegram
     send_signal_alert(
         symbol="XAU/USD",
         signal_type=signal["type"],
@@ -417,7 +601,7 @@ def main():
         fvg_size=signal.get("fvg_size"),
     )
 
-    # 6. บันทึกลง Google Sheets
+    # 10. บันทึกลง Google Sheets
     row_data = [
         signal["time"],
         signal["type"],
@@ -437,4 +621,3 @@ def main():
 
 if __name__ == "__main__":
   main()
-    
