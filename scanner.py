@@ -25,7 +25,7 @@ MODEL_FILE = "gold_ml_filter.pkl"
 def add_indicators(df):
     """คำนวณ ATR (14) และ RSI (14) ตามมาตรฐานสากล"""
     df = df.copy()
-    
+
     # 1. True Range & ATR (14)
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
@@ -93,18 +93,18 @@ def detect_demand_supply_zones(df, window=20):
         return {"demand": None, "supply": None}
 
     recent_df = df.iloc[-window:]
-    
+
     # Supply Zone: บริเวณสูงสุดของ Swing High ย้อนหลัง
     supply_high = recent_df["high"].max()
     supply_low = supply_high - (recent_df["atr"].iloc[-1] * 0.5 if "atr" in recent_df.columns else 1.0)
-    
+
     # Demand Zone: บริเวณต่ำสุดของ Swing Low ย้อนหลัง
     demand_low = recent_df["low"].min()
     demand_high = demand_low + (recent_df["atr"].iloc[-1] * 0.5 if "atr" in recent_df.columns else 1.0)
 
     return {
         "demand": (demand_low, demand_high),
-        "supply": (supply_low, supply_high)
+        "supply": (supply_low, supply_high),
     }
 
 
@@ -300,7 +300,7 @@ def process_telegram_commands(sheet):
                         opens = len(df_rec[df_rec["Status"].str.upper() == "OPEN"])
                         total = wins + losses
                         wr = (wins / total * 100) if total > 0 else 0.0
-                        
+
                         pnl = pd.to_numeric(df_rec["PnL"], errors="coerce").fillna(0.0).sum()
 
                         msg = (
@@ -554,4 +554,4 @@ def main():
     # 3. เช็ก News Filter (ข่าวแรง USD)
     is_news, news_title = is_high_impact_news_near(window_minutes=30)
     if is_news:
-        print(f"⚠️ [News Filter] 
+        print(f"⚠️ [News Filter] งดส่งสัญญาณเนื่องจากใกล้ช่วงข่าวแรง
