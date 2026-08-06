@@ -554,4 +554,4 @@ def main():
     # 3. เช็ก News Filter (ข่าวแรง USD)
     is_news, news_title = is_high_impact_news_near(window_minutes=30)
     if is_news:
-        print(f"⚠️ [News Filter T
+        print(f"⚠️ [News Filter] 
