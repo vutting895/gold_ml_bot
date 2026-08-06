@@ -1,9 +1,9 @@
+streamlit
 pandas
 numpy
-requests
-scikit-learn
-joblib
 gspread
 google-auth
-streamlit
+requests
 pytz
+scikit-learn
+joblib
