@@ -1,5 +1,8 @@
 name: Gold Real-time M5 Scanner
 
+permissions:
+  contents: read
+
 on:
   schedule:
     # รันอัตโนมัติทุกๆ 5 นาที (นาทีที่หารด้วย 5 ลงตัว)
