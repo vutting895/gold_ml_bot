@@ -1,169 +1,41 @@
-import json
-import os
-import gspread
-from google.oauth2.service_account import Credentials
-import joblib
-import numpy as np
-import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import GridSearchCV, train_test_split
+name: Retrain and Optimize ML Model
 
-MODEL_FILE = "gold_ml_filter.pkl"
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Gold_Trading_Logs")
+on:
+  schedule:
+    # รันอัตโนมัติทุกวันอาทิตย์ เวลา 07:00 น. (เวลาไทย)
+    - cron: '0 0 * * 0'
+  workflow_dispatch: # อนุญาตให้กดสั่งรันด้วยมือผ่านหน้าเว็บ GitHub ได้
 
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-def load_data_from_google_sheets():
-  """ดึงข้อมูลประวัติการเทรดจริง (WIN / LOSS) จาก Google Sheets เพื่อนำมาใช้ Retrain"""
-  if not GOOGLE_CREDENTIALS_JSON:
-    print(
-        "⚠️ ไม่พบ GOOGLE_CREDENTIALS_JSON (จะสลับไปใช้ Synthetic Optimization"
-        " แทน)"
-    )
-    return pd.DataFrame()
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-  try:
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    client = gspread.authorize(creds)
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    spreadsheet = client.open(GOOGLE_SHEET_NAME)
-    sheet = spreadsheet.worksheet("Signals")
-    records = sheet.get_all_records()
+      - name: Run Retrain & Optimization Script
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python retrain_and_optimize.py
 
-    if not records:
-      return pd.DataFrame()
-
-    df = pd.DataFrame(records)
-    # กรองเอาเฉพาะรายการที่รู้ผลแล้ว (WIN หรือ LOSS)
-    df["Status"] = df["Status"].astype(str).str.upper()
-    df = df[df["Status"].isin(["WIN", "LOSS"])].copy()
-
-    if len(df) < 20:
-      print(
-          f"⚠️ มีข้อมูลการเทรดที่ปิดแล้วเพียง {len(df)} รายการ"
-          " (ต้องการอย่างน้อย 20 รายการสำหรับ Retrain จริง)"
-      )
-      return pd.DataFrame()
-
-    # แปลงเป็น Label (WIN = 1, LOSS = 0)
-    df["target"] = (df["Status"] == "WIN").astype(int)
-
-    # คำนวณ Features ย้อนหลังสำหรับชุดข้อมูลจริง
-    df["risk_dist"] = (df["Entry"].astype(float) - df["SL"].astype(float)).abs()
-
-    # สมมุติค่าหากไม่มี Feature ย่อยใน Sheet
-    if "fvg_size" not in df.columns:
-      df["fvg_size"] = 1.5
-    if "atr" not in df.columns:
-      df["atr"] = 2.0
-    if "rsi" not in df.columns:
-      df["rsi"] = 50.0
-
-    t = pd.to_datetime(df["Time (UTC+7)"])
-    df["hour"] = t.dt.hour
-    df["dayofweek"] = t.dt.dayofweek
-
-    feature_cols = ["fvg_size", "atr", "rsi", "hour", "dayofweek", "risk_dist"]
-    return df[feature_cols + ["target"]]
-
-  except Exception as e:
-    print(f"เกิดข้อผิดพลาดในการโหลดข้อมูลจาก Google Sheets: {e}")
-    return pd.DataFrame()
-
-
-def generate_optimization_dataset(samples=2000):
-  """สร้างชุดข้อมูลสำหรับ Hyperparameter Optimization ตามพฤติกรรมทองคำ M5"""
-  np.random.seed(42)
-  fvg_size = np.random.uniform(0.5, 5.0, samples)
-  atr = np.random.uniform(1.0, 4.0, samples)
-  rsi = np.random.uniform(20, 80, samples)
-  hour = np.random.randint(0, 24, samples)
-  dayofweek = np.random.randint(0, 5, samples)
-  risk_dist = np.random.uniform(1.0, 6.0, samples)
-
-  X = np.column_stack([fvg_size, atr, rsi, hour, dayofweek, risk_dist])
-
-  # เงื่อนไขสร้าง Target คุณภาพสูงสำหรับ XAU/USD
-  # หลีกเลี่ยงช่วงเวลาสเปรดกว้าง (00:00-01:00) และเลือกช่วงสภาวะ RSI เสถียร
-  y = (
-      (rsi >= 32)
-      & (rsi <= 68)
-      & (fvg_size >= 0.8)
-      & (fvg_size <= 3.8)
-      & (risk_dist >= 1.2)
-      & (hour != 0)
-      & (hour != 23)
-  ).astype(int)
-
-  df = pd.DataFrame(
-      X, columns=["fvg_size", "atr", "rsi", "hour", "dayofweek", "risk_dist"]
-  )
-  df["target"] = y
-  return df
-
-
-def optimize_and_retrain():
-  print("🚀 เริ่มต้นกระบวนการ Retrain & Hyperparameter Optimization...")
-
-  # 1. โหลดข้อมูล (พยายามโหลดจาก Google Sheets ก่อน หากไม่มีให้ใช้ Optimization Dataset)
-  df = load_data_from_google_sheets()
-  if df.empty:
-    print("💡 ใช้ Optimization Dataset สำหรับปรับแต่งและวัดผลโมเดล...")
-    df = generate_optimization_dataset()
-
-  feature_cols = ["fvg_size", "atr", "rsi", "hour", "dayofweek", "risk_dist"]
-  X = df[feature_cols]
-  y = df["target"]
-
-  # 2. แบ่งข้อมูล Train / Test
-  X_train, X_test, y_train, y_test = train_test_split(
-      X, y, test_size=0.2, random_state=42, stratify=y
-  )
-
-  # 3. ค้นหาค่า Hyperparameters ที่ดีที่สุดด้วย GridSearchCV
-  print("🔍 กำลังค้นหา Hyperparameters ที่ดีที่สุดด้วย Grid Search CV...")
-  param_grid = {
-      "n_estimators": [50, 100, 150],
-      "max_depth": [4, 6, 8, 10],
-      "min_samples_split": [2, 5, 10],
-      "criterion": ["gini", "entropy"],
-  }
-
-  rf = RandomForestClassifier(random_state=42)
-  grid_search = GridSearchCV(
-      estimator=rf,
-      param_grid=param_grid,
-      cv=5,
-      scoring="f1",
-      n_jobs=-1,
-      verbose=1,
-  )
-
-  grid_search.fit(X_train, y_train)
-
-  best_model = grid_search.best_estimator_
-  print(f"\n✨ Hyperparameters ที่ดีที่สุด: {grid_search.best_params_}")
-
-  # 4. ประเมินผลโมเดลบนชุดข้อมูลทดสอบ (Test Set)
-  y_pred = best_model.predict(X_test)
-  acc = accuracy_score(y_test, y_pred)
-  print(f"🎯 ความแม่นยำ (Accuracy): {acc * 100:.2f}%")
-  print("\n📊 รายงานผลการประเมินโมเดล (Classification Report):")
-  print(classification_report(y_test, y_pred))
-
-  # 5. บันทึกโมเดลที่ปรับแต่งแล้วลงไฟล์ gold_ml_filter.pkl
-  joblib.dump(best_model, MODEL_FILE)
-  print(
-      f"✅ บันทึกโมเดลฉบับปรับแต่งแล้วลงไฟล์ '{MODEL_FILE}' เรียบร้อยแล้ว!"
-  )
-
-
-if __name__ == "__main__":
-  optimize_and_retrain()
-  
+      - name: Commit and Push updated model
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add gold_ml_filter.pkl
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-retrain ML model [skip ci]" && git push)
+          
