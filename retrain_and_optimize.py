@@ -1,0 +1,163 @@
+import json
+import os
+import gspread
+from google.oauth2.service_account import Credentials
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import GridSearchCV, train_test_split
+
+MODEL_FILE = "gold_ml_filter.pkl"
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Gold_Trading_Logs")
+
+
+def load_data_from_google_sheets():
+  """ดึงข้อมูลประวัติการเทรดจริง (WIN / LOSS) จาก Google Sheets เพื่อนำมาใช้ Retrain"""
+  if not GOOGLE_CREDENTIALS_JSON:
+    print("⚠️ ไม่พบ GOOGLE_CREDENTIALS_JSON (จะใช้อัลกอริทึมสังเคราะห์ข้อมูลแทน)")
+    return pd.DataFrame()
+
+  try:
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    client = gspread.authorize(creds)
+
+    spreadsheet = client.open(GOOGLE_SHEET_NAME)
+    sheet = spreadsheet.worksheet("Signals")
+    records = sheet.get_all_records()
+
+    if not records:
+      return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    # กรองเอาเฉพาะรายการรู้ผลแล้ว (WIN หรือ LOSS)
+    df["Status"] = df["Status"].astype(str).str.upper()
+    df = df[df["Status"].isin(["WIN", "LOSS"])].copy()
+
+    if len(df) < 20:
+      print(
+          f"⚠️ มีข้อมูลที่ปิดแล้วเพียง {len(df)} รายการ (ต้องการอย่างน้อย 20"
+          " รายการสำหรับฝึกโมเดลใหม่จากข้อมูลจริง)"
+      )
+      return pd.DataFrame()
+
+    # สร้าง Label (WIN = 1, LOSS = 0)
+    df["target"] = (df["Status"] == "WIN").astype(int)
+
+    # คำนวณ Feature เพิ่มเติม
+    df["risk_dist"] = (df["Entry"].astype(float) - df["SL"].astype(float)).abs()
+
+    if "fvg_size" not in df.columns:
+      df["fvg_size"] = 1.5
+    if "atr" not in df.columns:
+      df["atr"] = 2.0
+    if "rsi" not in df.columns:
+      df["rsi"] = 50.0
+
+    t = pd.to_datetime(df["Time (UTC+7)"])
+    df["hour"] = t.dt.hour
+    df["dayofweek"] = t.dt.dayofweek
+
+    feature_cols = ["fvg_size", "atr", "rsi", "hour", "dayofweek", "risk_dist"]
+    return df[feature_cols + ["target"]]
+
+  except Exception as e:
+    print(f"เกิดข้อผิดพลาดในการโหลดข้อมูล Google Sheets: {e}")
+    return pd.DataFrame()
+
+
+def generate_optimization_dataset(samples=2000):
+  """สร้างชุดข้อมูลสังเคราะห์สำหรับ Hyperparameter Optimization ตามแนวทางราคาทองคำ M5"""
+  np.random.seed(42)
+  fvg_size = np.random.uniform(0.5, 5.0, samples)
+  atr = np.random.uniform(1.0, 4.0, samples)
+  rsi = np.random.uniform(20, 80, samples)
+  hour = np.random.randint(0, 24, samples)
+  dayofweek = np.random.randint(0, 5, samples)
+  risk_dist = np.random.uniform(1.0, 6.0, samples)
+
+  X = np.column_stack([fvg_size, atr, rsi, hour, dayofweek, risk_dist])
+
+  # เงื่อนไขสร้าง Target ที่เหมาะสมสำหรับ XAU/USD
+  y = (
+      (rsi >= 32)
+      & (rsi <= 68)
+      & (fvg_size >= 0.8)
+      & (fvg_size <= 3.8)
+      & (risk_dist >= 1.2)
+      & (hour != 0)
+      & (hour != 23)
+  ).astype(int)
+
+  df = pd.DataFrame(
+      X, columns=["fvg_size", "atr", "rsi", "hour", "dayofweek", "risk_dist"]
+  )
+  df["target"] = y
+  return df
+
+
+def optimize_and_retrain():
+  print("🚀 เริ่มต้นกระบวนการ Retrain & Hyperparameter Optimization...")
+
+  # 1. โหลดข้อมูล (ลองดึงจาก Google Sheets ก่อน ถ้าไม่พอให้ใช้ชุดข้อมูลจำลอง)
+  df = load_data_from_google_sheets()
+  if df.empty:
+    print("💡 ใช้ชุดข้อมูลจำลอง Optimization สำหรับปรับแต่งและวัดผลโมเดล...")
+    df = generate_optimization_dataset()
+
+  feature_cols = ["fvg_size", "atr", "rsi", "hour", "dayofweek", "risk_dist"]
+  X = df[feature_cols]
+  y = df["target"]
+
+  # 2. แบ่งข้อมูล Train / Test
+  X_train, X_test, y_train, y_test = train_test_split(
+      X, y, test_size=0.2, random_state=42, stratify=y
+  )
+
+  # 3. ค้นหาค่า Hyperparameters ที่ดีที่สุดด้วย GridSearchCV
+  print("🔍 กำลังค้นหา Hyperparameters ที่ดีที่สุดด้วย Grid Search CV...")
+  param_grid = {
+      "n_estimators": [50, 100, 150],
+      "max_depth": [4, 6, 8, 10],
+      "min_samples_split": [2, 5, 10],
+      "criterion": ["gini", "entropy"],
+  }
+
+  rf = RandomForestClassifier(random_state=42)
+  grid_search = GridSearchCV(
+      estimator=rf,
+      param_grid=param_grid,
+      cv=5,
+      scoring="f1",
+      n_jobs=-1,
+      verbose=1,
+  )
+
+  grid_search.fit(X_train, y_train)
+
+  best_model = grid_search.best_estimator_
+  print(f"\n✨ Hyperparameters ที่ดีที่สุด: {grid_search.best_params_}")
+
+  # 4. ประเมินผลโมเดลบน Test Set
+  y_pred = best_model.predict(X_test)
+  acc = accuracy_score(y_test, y_pred)
+  print(f"🎯 Accuracy Score: {acc * 100:.2f}%")
+  print("\n📊 Classification Report:")
+  print(classification_report(y_test, y_pred))
+
+  # 5. บันทึกโมเดลลงไฟล์ gold_ml_filter.pkl
+  joblib.dump(best_model, MODEL_FILE)
+  print(f"✅ บันทึกโมเดลฉบับปรับแต่งแล้วลงไฟล์ '{MODEL_FILE}' สำเร็จ!")
+
+
+if __name__ == "__main__":
+  optimize_and_retrain()
+  
